@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-execution-engine"
+version = "0.1.0"
+description = "Production-grade autonomous trading platform rebuild focused on safe execution, durable state, reconciliation, and independent risk control."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Manus AI" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "src"
+]
+testpaths = [
+  "tests"
+]
