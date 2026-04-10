@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
     DriftCategory,
@@ -16,6 +18,41 @@ QUARANTINE_CATEGORIES = {
     DriftCategory.UNKNOWN_BROKER_ORDER,
     DriftCategory.MISSING_BROKER_ORDER,
 }
+
+
+class ReconciliationQuarantineError(ValueError):
+    """Raised when an account remains quarantined after reconciliation drift."""
+
+
+@dataclass
+class AccountQuarantineRegistry:
+    """Stores the latest reconciliation decision for each account."""
+
+    _reports: dict[str, ReconciliationReport] = field(default_factory=dict)
+
+    def record(self, *, report: ReconciliationReport) -> None:
+        self._reports[report.account_id] = report
+
+    def load_report(self, *, account_id: str) -> ReconciliationReport | None:
+        return self._reports.get(account_id)
+
+    def is_quarantined(self, *, account_id: str) -> bool:
+        report = self.load_report(account_id=account_id)
+        if report is None:
+            return False
+        return report.action is ReconciliationAction.QUARANTINE_ACCOUNT
+
+    def ensure_account_clear(self, *, account_id: str) -> None:
+        report = self.load_report(account_id=account_id)
+        if report is None:
+            return
+        if report.action is not ReconciliationAction.QUARANTINE_ACCOUNT:
+            return
+
+        drift_summary = ", ".join(drift.category.value for drift in report.drifts)
+        raise ReconciliationQuarantineError(
+            f"account {account_id} is quarantined due to reconciliation drift: {drift_summary}"
+        )
 
 
 class ReconciliationService:

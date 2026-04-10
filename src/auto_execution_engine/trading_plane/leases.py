@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 
 class LeaseError(ValueError):
@@ -31,8 +32,52 @@ class AccountLease:
         return replace(self, expires_at=now + timedelta(seconds=ttl_seconds))
 
 
+class AccountLeaseBackend(Protocol):
+    def acquire(
+        self,
+        *,
+        existing_lease: AccountLease | None,
+        account_id: str,
+        owner_id: str,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> AccountLease: ...
+
+
+class InMemoryAccountLeaseBackend:
+    def acquire(
+        self,
+        *,
+        existing_lease: AccountLease | None,
+        account_id: str,
+        owner_id: str,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> AccountLease:
+        if existing_lease is not None and existing_lease.is_active(now=now):
+            if existing_lease.owner_id != owner_id:
+                raise LeaseError(
+                    f"account {account_id} is already controlled by {existing_lease.owner_id}"
+                )
+            return existing_lease.renew(
+                owner_id=owner_id,
+                now=now,
+                ttl_seconds=ttl_seconds,
+            )
+
+        return AccountLease(
+            account_id=account_id,
+            owner_id=owner_id,
+            acquired_at=now,
+            expires_at=now + timedelta(seconds=ttl_seconds),
+        )
+
+
 class AccountLeaseService:
-    """Simple in-memory lease authority for account worker ownership."""
+    """Lease authority for account worker ownership."""
+
+    def __init__(self, *, backend: AccountLeaseBackend | None = None) -> None:
+        self._backend = backend or InMemoryAccountLeaseBackend()
 
     def acquire(
         self,
@@ -44,21 +89,10 @@ class AccountLeaseService:
         ttl_seconds: int = 30,
     ) -> AccountLease:
         current_time = now or datetime.now(UTC)
-
-        if existing_lease is not None and existing_lease.is_active(now=current_time):
-            if existing_lease.owner_id != owner_id:
-                raise LeaseError(
-                    f"account {account_id} is already controlled by {existing_lease.owner_id}"
-                )
-            return existing_lease.renew(
-                owner_id=owner_id,
-                now=current_time,
-                ttl_seconds=ttl_seconds,
-            )
-
-        return AccountLease(
+        return self._backend.acquire(
+            existing_lease=existing_lease,
             account_id=account_id,
             owner_id=owner_id,
-            acquired_at=current_time,
-            expires_at=current_time + timedelta(seconds=ttl_seconds),
+            now=current_time,
+            ttl_seconds=ttl_seconds,
         )
