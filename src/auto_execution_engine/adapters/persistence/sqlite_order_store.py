@@ -18,9 +18,11 @@ from auto_execution_engine.domain.orders.models import (
     OrderType,
 )
 from auto_execution_engine.reconciliation.models import (
+    BrokerOrderSnapshot,
     DriftCategory,
     InternalOrderSnapshot,
     ReconciliationAction,
+    ReconciliationCycleRecord,
     ReconciliationDrift,
     ReconciliationReport,
 )
@@ -169,10 +171,26 @@ class _SQLiteStore:
                 account_id TEXT NOT NULL,
                 generated_at TEXT NOT NULL,
                 action TEXT NOT NULL,
-                drifts_json TEXT NOT NULL
+                drifts_json TEXT NOT NULL,
+                internal_orders_json TEXT NOT NULL DEFAULT '[]',
+                broker_orders_json TEXT NOT NULL DEFAULT '[]'
             )
             """
         )
+        existing_report_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(reconciliation_reports)"
+            ).fetchall()
+        }
+        if "internal_orders_json" not in existing_report_columns:
+            connection.execute(
+                "ALTER TABLE reconciliation_reports ADD COLUMN internal_orders_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "broker_orders_json" not in existing_report_columns:
+            connection.execute(
+                "ALTER TABLE reconciliation_reports ADD COLUMN broker_orders_json TEXT NOT NULL DEFAULT '[]'"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_reconciliation_reports_account ON reconciliation_reports(account_id, report_sequence)"
         )
@@ -524,7 +542,13 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
         with self._connect() as connection:
             self._initialize_schema(connection)
 
-    def append(self, *, report: ReconciliationReport) -> None:
+    def append(
+        self,
+        *,
+        report: ReconciliationReport,
+        internal_orders: Iterable[InternalOrderSnapshot] = (),
+        broker_orders: Iterable[BrokerOrderSnapshot] = (),
+    ) -> None:
         serialized_drifts = [
             {
                 "category": drift.category.value,
@@ -534,6 +558,26 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
             }
             for drift in report.drifts
         ]
+        serialized_internal_orders = [
+            {
+                "account_id": order.account_id,
+                "client_order_id": order.client_order_id,
+                "status": order.status,
+                "filled_quantity": order.filled_quantity,
+                "symbol": order.symbol,
+            }
+            for order in internal_orders
+        ]
+        serialized_broker_orders = [
+            {
+                "account_id": order.account_id,
+                "client_order_id": order.client_order_id,
+                "status": order.status,
+                "filled_quantity": order.filled_quantity,
+                "symbol": order.symbol,
+            }
+            for order in broker_orders
+        ]
         with self._connect() as connection:
             self._initialize_schema(connection)
             connection.execute(
@@ -542,23 +586,33 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
                     account_id,
                     generated_at,
                     action,
-                    drifts_json
-                ) VALUES (?, ?, ?, ?)
+                    drifts_json,
+                    internal_orders_json,
+                    broker_orders_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     report.account_id,
                     report.generated_at.isoformat(),
                     report.action.value,
                     json.dumps(serialized_drifts, sort_keys=True),
+                    json.dumps(serialized_internal_orders, sort_keys=True),
+                    json.dumps(serialized_broker_orders, sort_keys=True),
                 ),
             )
 
     def load_latest(self, *, account_id: str) -> ReconciliationReport | None:
+        cycle = self.load_latest_cycle(account_id=account_id)
+        if cycle is None:
+            return None
+        return cycle.report
+
+    def load_latest_cycle(self, *, account_id: str) -> ReconciliationCycleRecord | None:
         with self._connect() as connection:
             self._initialize_schema(connection)
             row = connection.execute(
                 """
-                SELECT account_id, generated_at, action, drifts_json
+                SELECT account_id, generated_at, action, drifts_json, internal_orders_json, broker_orders_json
                 FROM reconciliation_reports
                 WHERE account_id = ?
                 ORDER BY report_sequence DESC
@@ -569,11 +623,44 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
 
         if row is None:
             return None
+        return self._cycle_from_row(row)
 
+    def list_cycles(self, *, account_id: str) -> list[ReconciliationCycleRecord]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT account_id, generated_at, action, drifts_json, internal_orders_json, broker_orders_json
+                FROM reconciliation_reports
+                WHERE account_id = ?
+                ORDER BY report_sequence ASC
+                """,
+                (account_id,),
+            ).fetchall()
+
+        return [self._cycle_from_row(row) for row in rows]
+
+    def list_account_ids(self) -> list[str]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT DISTINCT account_id
+                FROM reconciliation_reports
+                ORDER BY account_id ASC
+                """
+            ).fetchall()
+
+        return [str(row["account_id"]) for row in rows]
+
+    def _cycle_from_row(self, row: sqlite3.Row) -> ReconciliationCycleRecord:
         drifts_payload = json.loads(row["drifts_json"])
-        return ReconciliationReport(
+        internal_payload = json.loads(row["internal_orders_json"])
+        broker_payload = json.loads(row["broker_orders_json"])
+        generated_at = datetime.fromisoformat(row["generated_at"])
+        report = ReconciliationReport(
             account_id=row["account_id"],
-            generated_at=datetime.fromisoformat(row["generated_at"]),
+            generated_at=generated_at,
             action=ReconciliationAction(row["action"]),
             drifts=tuple(
                 ReconciliationDrift(
@@ -589,19 +676,31 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
                 for drift in drifts_payload
             ),
         )
-
-    def list_account_ids(self) -> list[str]:
-        with self._connect() as connection:
-            self._initialize_schema(connection)
-            rows = connection.execute(
-                """
-                SELECT DISTINCT account_id
-                FROM reconciliation_reports
-                ORDER BY account_id ASC
-                """
-            ).fetchall()
-
-        return [str(row["account_id"]) for row in rows]
+        return ReconciliationCycleRecord(
+            account_id=row["account_id"],
+            generated_at=generated_at,
+            internal_orders=tuple(
+                InternalOrderSnapshot(
+                    account_id=str(order["account_id"]),
+                    client_order_id=str(order["client_order_id"]),
+                    status=str(order["status"]),
+                    filled_quantity=float(order["filled_quantity"]),
+                    symbol=str(order["symbol"]),
+                )
+                for order in internal_payload
+            ),
+            broker_orders=tuple(
+                BrokerOrderSnapshot(
+                    account_id=str(order["account_id"]),
+                    client_order_id=str(order["client_order_id"]),
+                    status=str(order["status"]),
+                    filled_quantity=float(order["filled_quantity"]),
+                    symbol=str(order["symbol"]),
+                )
+                for order in broker_payload
+            ),
+            report=report,
+        )
 
 
 class SQLiteSubmissionBook(_SQLiteStore):
@@ -878,13 +977,33 @@ class SQLiteOrderStore:
     def list_accounts_requiring_reconciliation(self) -> list[str]:
         return self._order_journal.list_active_account_ids()
 
-    def record_reconciliation_report(self, *, report: ReconciliationReport) -> None:
-        self._reconciliation_reports.append(report=report)
+    def record_reconciliation_report(
+        self,
+        *,
+        report: ReconciliationReport,
+        internal_orders: Iterable[InternalOrderSnapshot] = (),
+        broker_orders: Iterable[BrokerOrderSnapshot] = (),
+    ) -> None:
+        self._reconciliation_reports.append(
+            report=report,
+            internal_orders=internal_orders,
+            broker_orders=broker_orders,
+        )
 
     def load_latest_reconciliation_report(
         self, *, account_id: str
     ) -> ReconciliationReport | None:
         return self._reconciliation_reports.load_latest(account_id=account_id)
+
+    def load_latest_reconciliation_cycle(
+        self, *, account_id: str
+    ) -> ReconciliationCycleRecord | None:
+        return self._reconciliation_reports.load_latest_cycle(account_id=account_id)
+
+    def list_reconciliation_cycles(
+        self, *, account_id: str
+    ) -> list[ReconciliationCycleRecord]:
+        return self._reconciliation_reports.list_cycles(account_id=account_id)
 
     def list_accounts_with_reconciliation_reports(self) -> list[str]:
         return self._reconciliation_reports.list_account_ids()

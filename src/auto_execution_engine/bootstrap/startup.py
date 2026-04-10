@@ -123,14 +123,19 @@ def reconcile_account_startup_state(
 ) -> ReconciliationReport:
     store = order_store or build_order_store(context=context)
     store.repair_orders_from_submissions(account_id=account_id)
+    internal_orders = store.list_internal_order_snapshots(account_id=account_id)
     service = reconciliation_service or ReconciliationService()
     report = service.compare_orders(
         account_id=account_id,
-        internal_orders=store.list_internal_order_snapshots(account_id=account_id),
+        internal_orders=internal_orders,
         broker_orders=broker_orders,
     )
     if persist_report:
-        store.record_reconciliation_report(report=report)
+        store.record_reconciliation_report(
+            report=report,
+            internal_orders=internal_orders,
+            broker_orders=broker_orders,
+        )
     if quarantine_registry is not None:
         quarantine_registry.record(report=report)
     return report

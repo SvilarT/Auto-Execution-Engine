@@ -56,3 +56,12 @@ class ReconciliationReport:
     @property
     def has_drift(self) -> bool:
         return bool(self.drifts)
+
+
+@dataclass(frozen=True)
+class ReconciliationCycleRecord:
+    account_id: str
+    generated_at: datetime
+    internal_orders: tuple[InternalOrderSnapshot, ...]
+    broker_orders: tuple[BrokerOrderSnapshot, ...]
+    report: ReconciliationReport

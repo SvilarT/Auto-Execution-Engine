@@ -21,7 +21,14 @@ from auto_execution_engine.domain.orders.models import (
     OrderStatus,
     OrderType,
 )
-from auto_execution_engine.reconciliation.models import InternalOrderSnapshot
+from auto_execution_engine.reconciliation.models import (
+    BrokerOrderSnapshot,
+    DriftCategory,
+    InternalOrderSnapshot,
+    ReconciliationAction,
+    ReconciliationDrift,
+    ReconciliationReport,
+)
 
 
 @pytest.fixture
@@ -197,6 +204,63 @@ def test_order_store_projects_latest_internal_snapshots_for_reconciliation(
             symbol="AAPL",
         ),
     ]
+
+
+def test_order_store_persists_reconciliation_cycle_inputs_and_latest_report(
+    db_path: Path,
+) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+    generated_at = datetime(2026, 1, 2, tzinfo=UTC)
+    report = ReconciliationReport(
+        account_id="acct-1",
+        generated_at=generated_at,
+        action=ReconciliationAction.QUARANTINE_ACCOUNT,
+        drifts=(
+            ReconciliationDrift(
+                category=DriftCategory.MISSING_BROKER_ORDER,
+                account_id="acct-1",
+                client_order_id="client-123",
+                detail="broker snapshot did not include submitted order",
+            ),
+        ),
+    )
+    internal_orders = [
+        InternalOrderSnapshot(
+            account_id="acct-1",
+            client_order_id="client-123",
+            status="submitted",
+            filled_quantity=0.0,
+            symbol="AAPL",
+        )
+    ]
+    broker_orders = [
+        BrokerOrderSnapshot(
+            account_id="acct-1",
+            client_order_id="client-999",
+            status="acknowledged",
+            filled_quantity=0.0,
+            symbol="AAPL",
+        )
+    ]
+
+    store.record_reconciliation_report(
+        report=report,
+        internal_orders=internal_orders,
+        broker_orders=broker_orders,
+    )
+
+    restarted_store = SQLiteOrderStore(db_path=db_path)
+    latest_report = restarted_store.load_latest_reconciliation_report(account_id="acct-1")
+    latest_cycle = restarted_store.load_latest_reconciliation_cycle(account_id="acct-1")
+    cycles = restarted_store.list_reconciliation_cycles(account_id="acct-1")
+
+    assert latest_report == report
+    assert latest_cycle is not None
+    assert latest_cycle.report == report
+    assert latest_cycle.internal_orders == tuple(internal_orders)
+    assert latest_cycle.broker_orders == tuple(broker_orders)
+    assert cycles == [latest_cycle]
 
 
 def test_submission_book_persists_registered_submission_across_restart(db_path: Path) -> None:

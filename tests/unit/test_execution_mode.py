@@ -237,6 +237,56 @@ def test_startup_reconciliation_repairs_created_order_from_durable_submission(
     assert store.load_order(client_order_id="startup-gap-1").status is OrderStatus.SUBMITTED
 
 
+def test_startup_reconciliation_persists_full_cycle_inputs_and_outcomes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "paper")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+
+    context = load_startup_context()
+    store = build_order_store(context=context)
+    order = OrderAggregate(
+        account_id="acct-1",
+        symbol="BTC-USD",
+        side=OrderSide.BUY,
+        quantity=1.0,
+        order_type=OrderType.MARKET,
+        client_order_id="restart-ord-journal",
+    )
+    created_event = order.create_event()
+    approved_order, approved_event = order.transition(OrderStatus.RISK_APPROVED)
+    submitted_order, submitted_event = approved_order.transition(OrderStatus.SUBMITTED)
+    store.record_events(events=[created_event, approved_event, submitted_event])
+
+    broker_orders = [
+        BrokerOrderSnapshot(
+            account_id="acct-1",
+            client_order_id=submitted_order.client_order_id,
+            status="submitted",
+            filled_quantity=0.0,
+            symbol="BTC-USD",
+        )
+    ]
+
+    report = reconcile_account_startup_state(
+        context=context,
+        account_id="acct-1",
+        broker_orders=broker_orders,
+        order_store=store,
+    )
+    cycle = store.load_latest_reconciliation_cycle(account_id="acct-1")
+
+    assert cycle is not None
+    assert cycle.report == report
+    assert cycle.internal_orders[0].client_order_id == submitted_order.client_order_id
+    assert cycle.broker_orders == tuple(broker_orders)
+
+
 def test_startup_reconciliation_records_quarantine_from_persisted_internal_snapshots(
     monkeypatch, tmp_path: Path
 ) -> None:
