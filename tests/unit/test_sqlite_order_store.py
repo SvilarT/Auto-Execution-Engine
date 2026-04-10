@@ -304,3 +304,58 @@ def test_account_lease_backend_rejects_competing_owner_while_active(db_path: Pat
             now=now.replace(second=10),
             ttl_seconds=30,
         )
+
+
+
+def test_account_lease_backend_release_allows_immediate_handoff(db_path: Path) -> None:
+    backend = SQLiteAccountLeaseBackend(db_path=db_path)
+    backend.initialize()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    lease = backend.acquire(
+        existing_lease=None,
+        account_id="acct-1",
+        owner_id="worker-a",
+        now=now,
+        ttl_seconds=30,
+    )
+    SQLiteAccountLeaseBackend(db_path=db_path).release(
+        existing_lease=lease,
+        account_id="acct-1",
+        owner_id="worker-a",
+        now=now.replace(second=5),
+    )
+
+    successor = SQLiteAccountLeaseBackend(db_path=db_path).acquire(
+        existing_lease=None,
+        account_id="acct-1",
+        owner_id="worker-b",
+        now=now.replace(second=6),
+        ttl_seconds=30,
+    )
+
+    assert successor.owner_id == "worker-b"
+    assert successor.acquired_at == now.replace(second=6)
+
+
+
+def test_account_lease_backend_release_rejects_wrong_owner(db_path: Path) -> None:
+    backend = SQLiteAccountLeaseBackend(db_path=db_path)
+    backend.initialize()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    lease = backend.acquire(
+        existing_lease=None,
+        account_id="acct-1",
+        owner_id="worker-a",
+        now=now,
+        ttl_seconds=30,
+    )
+
+    with pytest.raises(ValueError, match="worker-a"):
+        SQLiteAccountLeaseBackend(db_path=db_path).release(
+            existing_lease=lease,
+            account_id="acct-1",
+            owner_id="worker-b",
+            now=now.replace(second=5),
+        )

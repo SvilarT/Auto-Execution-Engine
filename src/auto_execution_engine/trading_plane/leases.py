@@ -43,6 +43,15 @@ class AccountLeaseBackend(Protocol):
         ttl_seconds: int,
     ) -> AccountLease: ...
 
+    def release(
+        self,
+        *,
+        existing_lease: AccountLease | None,
+        account_id: str,
+        owner_id: str,
+        now: datetime,
+    ) -> None: ...
+
 
 class InMemoryAccountLeaseBackend:
     def acquire(
@@ -72,6 +81,22 @@ class InMemoryAccountLeaseBackend:
             expires_at=now + timedelta(seconds=ttl_seconds),
         )
 
+    def release(
+        self,
+        *,
+        existing_lease: AccountLease | None,
+        account_id: str,
+        owner_id: str,
+        now: datetime,
+    ) -> None:
+        if existing_lease is None:
+            return
+        if existing_lease.account_id != account_id:
+            raise LeaseError(
+                f"lease belongs to {existing_lease.account_id}, not {account_id}"
+            )
+        existing_lease.assert_owned_by(owner_id=owner_id, now=now)
+
 
 class AccountLeaseService:
     """Lease authority for account worker ownership."""
@@ -95,4 +120,20 @@ class AccountLeaseService:
             owner_id=owner_id,
             now=current_time,
             ttl_seconds=ttl_seconds,
+        )
+
+    def release(
+        self,
+        *,
+        existing_lease: AccountLease | None,
+        account_id: str,
+        owner_id: str,
+        now: datetime | None = None,
+    ) -> None:
+        current_time = now or datetime.now(UTC)
+        self._backend.release(
+            existing_lease=existing_lease,
+            account_id=account_id,
+            owner_id=owner_id,
+            now=current_time,
         )

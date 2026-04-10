@@ -748,6 +748,49 @@ class SQLiteAccountLeaseBackend(_SQLiteStore):
             expires_at=expires_at,
         )
 
+    def release(
+        self,
+        *,
+        existing_lease: AccountLease | None,
+        account_id: str,
+        owner_id: str,
+        now: datetime,
+    ) -> None:
+        del existing_lease
+
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT account_id, owner_id, acquired_at, expires_at
+                FROM account_leases
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                return
+
+            current_lease = AccountLease(
+                account_id=row["account_id"],
+                owner_id=row["owner_id"],
+                acquired_at=datetime.fromisoformat(row["acquired_at"]),
+                expires_at=datetime.fromisoformat(row["expires_at"]),
+            )
+            if not current_lease.is_active(now=now):
+                connection.execute(
+                    "DELETE FROM account_leases WHERE account_id = ?",
+                    (account_id,),
+                )
+                return
+
+            current_lease.assert_owned_by(owner_id=owner_id, now=now)
+            connection.execute(
+                "DELETE FROM account_leases WHERE account_id = ? AND owner_id = ?",
+                (account_id, owner_id),
+            )
+
 
 class SQLiteOrderStore:
     """Coordinates durable event recording, append-only journaling, and order replay."""

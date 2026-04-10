@@ -94,3 +94,55 @@ def test_different_owner_can_acquire_after_expiry():
     )
 
     assert successor.owner_id == "worker-b"
+
+
+
+def test_owner_can_release_lease_for_immediate_handoff():
+    service = AccountLeaseService()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+
+    lease = service.acquire(
+        existing_lease=None,
+        account_id="acct-1",
+        owner_id="worker-a",
+        now=start,
+        ttl_seconds=30,
+    )
+    service.release(
+        existing_lease=lease,
+        account_id="acct-1",
+        owner_id="worker-a",
+        now=start + timedelta(seconds=5),
+    )
+
+    successor = service.acquire(
+        existing_lease=None,
+        account_id="acct-1",
+        owner_id="worker-b",
+        now=start + timedelta(seconds=6),
+        ttl_seconds=30,
+    )
+
+    assert successor.owner_id == "worker-b"
+
+
+
+def test_release_rejects_wrong_owner():
+    service = AccountLeaseService()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+
+    lease = service.acquire(
+        existing_lease=None,
+        account_id="acct-1",
+        owner_id="worker-a",
+        now=start,
+        ttl_seconds=30,
+    )
+
+    with pytest.raises(LeaseError):
+        service.release(
+            existing_lease=lease,
+            account_id="acct-1",
+            owner_id="worker-b",
+            now=start + timedelta(seconds=5),
+        )
