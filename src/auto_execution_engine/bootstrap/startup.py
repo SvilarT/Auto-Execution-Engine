@@ -122,6 +122,7 @@ def reconcile_account_startup_state(
     persist_report: bool = True,
 ) -> ReconciliationReport:
     store = order_store or build_order_store(context=context)
+    store.repair_orders_from_submissions(account_id=account_id)
     service = reconciliation_service or ReconciliationService()
     report = service.compare_orders(
         account_id=account_id,
@@ -145,6 +146,12 @@ def reconcile_all_startup_accounts(
 ) -> list[ReconciliationReport]:
     store = order_store or build_order_store(context=context)
     reports: list[ReconciliationReport] = []
+
+    account_ids = set(store.list_accounts_requiring_reconciliation())
+    account_ids.update(store.list_accounts_with_reconciliation_reports())
+
+    for account_id in sorted(account_ids):
+        store.repair_orders_from_submissions(account_id=account_id)
 
     account_ids = set(store.list_accounts_requiring_reconciliation())
     account_ids.update(store.list_accounts_with_reconciliation_reports())

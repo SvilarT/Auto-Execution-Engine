@@ -242,6 +242,48 @@ def test_execution_service_uses_durable_submission_book_across_restart(db_path: 
     assert restarted_ack.broker_order_id == result.broker_order_id
 
 
+def test_execution_service_repairs_created_order_when_submission_is_already_durable(
+    db_path: Path,
+) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    submission_service = BrokerSubmissionService(
+        submission_book=SQLiteSubmissionBook(db_path=db_path)
+    )
+    order = make_order()
+    order_store.record_events(events=[order.create_event()])
+    submission_service.register_submission(
+        request=BrokerOrderRequestBuilder().build(
+            order=order.transition(OrderStatus.RISK_APPROVED)[0]
+        )
+    )
+
+    restarted_service = make_service(
+        order_store=SQLiteOrderStore(db_path=db_path),
+        broker_submission_service=BrokerSubmissionService(
+            submission_book=SQLiteSubmissionBook(db_path=db_path)
+        ),
+    )
+    result = restarted_service.execute_order(
+        order=order,
+        strategy_id="strat-1",
+        reference_price=30_000,
+        kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+        owner_id="worker-a",
+        existing_lease=None,
+    )
+
+    recovered_order = order_store.load_order(client_order_id=order.client_order_id)
+
+    assert result.order.status is OrderStatus.SUBMITTED
+    assert [event.event_type.value for event in result.events] == [
+        "risk_approved",
+        "order_submitted",
+    ]
+    assert result.broker_order_id == f"pending::{order.client_order_id}"
+    assert recovered_order.status is OrderStatus.SUBMITTED
+
+
 def test_execution_service_uses_durable_account_lease_across_restart(db_path: Path) -> None:
     lease_service = AccountLeaseService(
         backend=SQLiteAccountLeaseBackend(db_path=db_path)

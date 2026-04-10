@@ -185,6 +185,58 @@ def test_startup_builds_durable_account_lease_service_from_runtime_namespace(
         )
 
 
+def test_startup_reconciliation_repairs_created_order_from_durable_submission(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "paper")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+
+    context = load_startup_context()
+    store = build_order_store(context=context)
+    order = OrderAggregate(
+        account_id="acct-1",
+        symbol="BTC-USD",
+        side=OrderSide.BUY,
+        quantity=1.0,
+        order_type=OrderType.MARKET,
+        client_order_id="startup-gap-1",
+    )
+    store.record_events(events=[order.create_event()])
+    build_submission_service(context=context).register_submission(
+        request=BrokerOrderRequest(
+            account_id="acct-1",
+            client_order_id="startup-gap-1",
+            symbol="BTC-USD",
+            side=BrokerOrderSide.BUY,
+            quantity=1.0,
+            order_type=BrokerOrderType.MARKET,
+        )
+    )
+
+    report = reconcile_account_startup_state(
+        context=context,
+        account_id="acct-1",
+        broker_orders=[
+            BrokerOrderSnapshot(
+                account_id="acct-1",
+                client_order_id="startup-gap-1",
+                status="submitted",
+                filled_quantity=0.0,
+                symbol="BTC-USD",
+            )
+        ],
+        order_store=store,
+    )
+
+    assert report.has_drift is False
+    assert store.load_order(client_order_id="startup-gap-1").status is OrderStatus.SUBMITTED
+
+
 def test_startup_reconciliation_records_quarantine_from_persisted_internal_snapshots(
     monkeypatch, tmp_path: Path
 ) -> None:

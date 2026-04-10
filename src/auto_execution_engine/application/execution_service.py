@@ -67,6 +67,24 @@ class ExecutionApplicationService:
     ) -> ExecutionResult:
         self._ensure_account_execution_allowed(account_id=order.account_id)
         order = self._restore_or_record_order(order=order)
+        recovered_submission = self._broker_submission_service.load_submission(
+            client_order_id=order.client_order_id
+        )
+        if recovered_submission is not None and order.status is not OrderStatus.SUBMITTED:
+            lease = self._acquire_execution_lease(
+                existing_lease=existing_lease,
+                account_id=order.account_id,
+                owner_id=owner_id,
+            )
+            repaired_order, recovery_events = self._recover_submitted_order(order=order)
+            if recovery_events and self._order_store is not None:
+                self._order_store.record_events(events=recovery_events)
+            return ExecutionResult(
+                order=repaired_order,
+                events=recovery_events,
+                broker_order_id=recovered_submission.broker_order_id,
+                lease=lease,
+            )
         if order.status is not OrderStatus.CREATED:
             raise ExecutionRejectedError(
                 "order "
@@ -88,14 +106,11 @@ class ExecutionApplicationService:
                 f"risk rejected order {order.client_order_id}: {decision.reason_code}"
             )
 
-        try:
-            lease = self._lease_service.acquire(
-                existing_lease=existing_lease,
-                account_id=order.account_id,
-                owner_id=owner_id,
-            )
-        except LeaseError as exc:
-            raise ExecutionRejectedError(str(exc)) from exc
+        lease = self._acquire_execution_lease(
+            existing_lease=existing_lease,
+            account_id=order.account_id,
+            owner_id=owner_id,
+        )
 
         risk_approved_order, risk_event = order.transition(OrderStatus.RISK_APPROVED)
         broker_request = self._broker_request_builder.build(order=risk_approved_order)
@@ -116,6 +131,36 @@ class ExecutionApplicationService:
         if self._order_store is None:
             raise ExecutionRejectedError("durable order store is not configured")
         return self._order_store.load_order(client_order_id=client_order_id)
+
+    def _acquire_execution_lease(
+        self,
+        *,
+        existing_lease: AccountLease | None,
+        account_id: str,
+        owner_id: str,
+    ) -> AccountLease:
+        try:
+            return self._lease_service.acquire(
+                existing_lease=existing_lease,
+                account_id=account_id,
+                owner_id=owner_id,
+            )
+        except LeaseError as exc:
+            raise ExecutionRejectedError(str(exc)) from exc
+
+    def _recover_submitted_order(
+        self, *, order: OrderAggregate
+    ) -> tuple[OrderAggregate, list[DomainEvent]]:
+        recovery_events: list[DomainEvent] = []
+
+        if order.status is OrderStatus.CREATED:
+            order, risk_event = order.transition(OrderStatus.RISK_APPROVED)
+            recovery_events.append(risk_event)
+        if order.status is OrderStatus.RISK_APPROVED:
+            order, submitted_event = order.transition(OrderStatus.SUBMITTED)
+            recovery_events.append(submitted_event)
+
+        return order, recovery_events
 
     def _ensure_account_execution_allowed(self, *, account_id: str) -> None:
         if self._account_execution_gate is None:

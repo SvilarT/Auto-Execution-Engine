@@ -803,6 +803,35 @@ class SQLiteOrderStore:
         entries = self._order_journal.list_latest_entries(account_id=account_id)
         return [entry.to_internal_order_snapshot() for entry in entries]
 
+    def repair_orders_from_submissions(self, *, account_id: str | None = None) -> list[str]:
+        repaired_client_order_ids: list[str] = []
+        entries = self._order_journal.list_latest_entries(account_id=account_id)
+
+        for entry in entries:
+            submission = self._submission_book.load_submission(
+                client_order_id=entry.client_order_id
+            )
+            if submission is None:
+                continue
+
+            order = self.load_order(client_order_id=entry.client_order_id)
+            recovery_events: list[DomainEvent] = []
+
+            if order.status is OrderStatus.CREATED:
+                order, risk_event = order.transition(OrderStatus.RISK_APPROVED)
+                recovery_events.append(risk_event)
+            if order.status is OrderStatus.RISK_APPROVED:
+                order, submitted_event = order.transition(OrderStatus.SUBMITTED)
+                recovery_events.append(submitted_event)
+
+            if not recovery_events:
+                continue
+
+            self.record_events(events=recovery_events)
+            repaired_client_order_ids.append(entry.client_order_id)
+
+        return repaired_client_order_ids
+
     def list_accounts_requiring_reconciliation(self) -> list[str]:
         return self._order_journal.list_active_account_ids()
 
