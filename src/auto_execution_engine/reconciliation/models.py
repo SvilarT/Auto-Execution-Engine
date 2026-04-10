@@ -12,12 +12,19 @@ class DriftCategory(str, Enum):
     CASH_MISMATCH = "cash_mismatch"
     UNKNOWN_BROKER_ORDER = "unknown_broker_order"
     MISSING_BROKER_ORDER = "missing_broker_order"
+    RECONCILIATION_RUN_FAILURE = "reconciliation_run_failure"
 
 
 class ReconciliationAction(str, Enum):
     NO_ACTION = "no_action"
     LOG_ONLY = "log_only"
     QUARANTINE_ACCOUNT = "quarantine_account"
+
+
+class ReconciliationRunStatus(str, Enum):
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -65,3 +72,15 @@ class ReconciliationCycleRecord:
     internal_orders: tuple[InternalOrderSnapshot, ...]
     broker_orders: tuple[BrokerOrderSnapshot, ...]
     report: ReconciliationReport
+
+
+@dataclass(frozen=True)
+class ReconciliationRunRecord:
+    run_id: str
+    account_id: str
+    owner_id: str
+    started_at: datetime
+    completed_at: datetime
+    status: ReconciliationRunStatus
+    detail: str
+    report: ReconciliationReport | None = None

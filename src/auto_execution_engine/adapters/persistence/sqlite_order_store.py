@@ -25,6 +25,8 @@ from auto_execution_engine.reconciliation.models import (
     ReconciliationCycleRecord,
     ReconciliationDrift,
     ReconciliationReport,
+    ReconciliationRunRecord,
+    ReconciliationRunStatus,
 )
 from auto_execution_engine.trading_plane.leases import (
     AccountLease,
@@ -193,6 +195,24 @@ class _SQLiteStore:
             )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_reconciliation_reports_account ON reconciliation_reports(account_id, report_sequence)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reconciliation_runs (
+                run_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                account_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                report_json TEXT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_account ON reconciliation_runs(account_id, run_sequence)"
         )
         connection.execute(
             """
@@ -653,28 +673,85 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
 
         return [str(row["account_id"]) for row in rows]
 
+    def append_run(self, *, record: ReconciliationRunRecord) -> None:
+        serialized_report = None
+        if record.report is not None:
+            serialized_report = json.dumps(
+                self._serialize_report(record.report),
+                sort_keys=True,
+            )
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO reconciliation_runs(
+                    run_id,
+                    account_id,
+                    owner_id,
+                    started_at,
+                    completed_at,
+                    status,
+                    detail,
+                    report_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.run_id,
+                    record.account_id,
+                    record.owner_id,
+                    record.started_at.isoformat(),
+                    record.completed_at.isoformat(),
+                    record.status.value,
+                    record.detail,
+                    serialized_report,
+                ),
+            )
+
+    def load_latest_run(self, *, account_id: str) -> ReconciliationRunRecord | None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            row = connection.execute(
+                """
+                SELECT run_id, account_id, owner_id, started_at, completed_at, status, detail, report_json
+                FROM reconciliation_runs
+                WHERE account_id = ?
+                ORDER BY run_sequence DESC
+                LIMIT 1
+                """,
+                (account_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return self._run_from_row(row)
+
+    def list_runs(self, *, account_id: str) -> list[ReconciliationRunRecord]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT run_id, account_id, owner_id, started_at, completed_at, status, detail, report_json
+                FROM reconciliation_runs
+                WHERE account_id = ?
+                ORDER BY run_sequence ASC
+                """,
+                (account_id,),
+            ).fetchall()
+
+        return [self._run_from_row(row) for row in rows]
+
     def _cycle_from_row(self, row: sqlite3.Row) -> ReconciliationCycleRecord:
         drifts_payload = json.loads(row["drifts_json"])
         internal_payload = json.loads(row["internal_orders_json"])
         broker_payload = json.loads(row["broker_orders_json"])
         generated_at = datetime.fromisoformat(row["generated_at"])
-        report = ReconciliationReport(
-            account_id=row["account_id"],
-            generated_at=generated_at,
-            action=ReconciliationAction(row["action"]),
-            drifts=tuple(
-                ReconciliationDrift(
-                    category=DriftCategory(drift["category"]),
-                    account_id=str(drift["account_id"]),
-                    client_order_id=(
-                        None
-                        if drift.get("client_order_id") is None
-                        else str(drift["client_order_id"])
-                    ),
-                    detail=str(drift["detail"]),
-                )
-                for drift in drifts_payload
-            ),
+        report = self._report_from_payload(
+            {
+                "account_id": row["account_id"],
+                "generated_at": row["generated_at"],
+                "action": row["action"],
+                "drifts": drifts_payload,
+            }
         )
         return ReconciliationCycleRecord(
             account_id=row["account_id"],
@@ -700,6 +777,57 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
                 for order in broker_payload
             ),
             report=report,
+        )
+
+    def _run_from_row(self, row: sqlite3.Row) -> ReconciliationRunRecord:
+        report = None
+        if row["report_json"] is not None:
+            report = self._report_from_payload(json.loads(row["report_json"]))
+        return ReconciliationRunRecord(
+            run_id=str(row["run_id"]),
+            account_id=str(row["account_id"]),
+            owner_id=str(row["owner_id"]),
+            started_at=datetime.fromisoformat(row["started_at"]),
+            completed_at=datetime.fromisoformat(row["completed_at"]),
+            status=ReconciliationRunStatus(row["status"]),
+            detail=str(row["detail"]),
+            report=report,
+        )
+
+    def _serialize_report(self, report: ReconciliationReport) -> dict[str, object]:
+        return {
+            "account_id": report.account_id,
+            "generated_at": report.generated_at.isoformat(),
+            "action": report.action.value,
+            "drifts": [
+                {
+                    "category": drift.category.value,
+                    "account_id": drift.account_id,
+                    "client_order_id": drift.client_order_id,
+                    "detail": drift.detail,
+                }
+                for drift in report.drifts
+            ],
+        }
+
+    def _report_from_payload(self, payload: dict[str, object]) -> ReconciliationReport:
+        return ReconciliationReport(
+            account_id=str(payload["account_id"]),
+            generated_at=datetime.fromisoformat(str(payload["generated_at"])),
+            action=ReconciliationAction(str(payload["action"])),
+            drifts=tuple(
+                ReconciliationDrift(
+                    category=DriftCategory(str(drift["category"])),
+                    account_id=str(drift["account_id"]),
+                    client_order_id=(
+                        None
+                        if drift.get("client_order_id") is None
+                        else str(drift["client_order_id"])
+                    ),
+                    detail=str(drift["detail"]),
+                )
+                for drift in payload["drifts"]
+            ),
         )
 
 
@@ -1007,6 +1135,17 @@ class SQLiteOrderStore:
 
     def list_accounts_with_reconciliation_reports(self) -> list[str]:
         return self._reconciliation_reports.list_account_ids()
+
+    def record_reconciliation_run(self, *, record: ReconciliationRunRecord) -> None:
+        self._reconciliation_reports.append_run(record=record)
+
+    def load_latest_reconciliation_run(
+        self, *, account_id: str
+    ) -> ReconciliationRunRecord | None:
+        return self._reconciliation_reports.load_latest_run(account_id=account_id)
+
+    def list_reconciliation_runs(self, *, account_id: str) -> list[ReconciliationRunRecord]:
+        return self._reconciliation_reports.list_runs(account_id=account_id)
 
     def build_submission_book(self) -> SQLiteSubmissionBook:
         self._submission_book.initialize()

@@ -4,6 +4,7 @@ from auto_execution_engine.bootstrap.startup import (
     build_account_lease_service,
     build_account_quarantine_registry,
     build_order_store,
+    build_reconciliation_runner,
     build_submission_service,
     load_startup_context,
     reconcile_account_startup_state,
@@ -28,7 +29,9 @@ from auto_execution_engine.domain.orders.models import (
 )
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
+    DriftCategory,
     ReconciliationAction,
+    ReconciliationRunStatus,
 )
 
 
@@ -235,6 +238,42 @@ def test_startup_reconciliation_repairs_created_order_from_durable_submission(
 
     assert report.has_drift is False
     assert store.load_order(client_order_id="startup-gap-1").status is OrderStatus.SUBMITTED
+
+
+def test_startup_builds_reconciliation_runner_from_runtime_namespace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "paper")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+
+    context = load_startup_context()
+    store = build_order_store(context=context)
+    quarantine_registry = build_account_quarantine_registry(order_store=store)
+    runner = build_reconciliation_runner(
+        context=context,
+        order_store=store,
+        quarantine_registry=quarantine_registry,
+        owner_id="startup-runner-test",
+    )
+
+    records = runner.run_once(
+        account_ids=["acct-77"],
+        snapshot_loader=lambda _account_id: (_ for _ in ()).throw(RuntimeError("broker timeout")),
+        now=datetime(2026, 1, 5, tzinfo=UTC),
+    )
+
+    assert [record.status for record in records] == [ReconciliationRunStatus.FAILED]
+    latest_run = store.load_latest_reconciliation_run(account_id="acct-77")
+    assert latest_run is not None
+    assert latest_run.detail == "broker timeout"
+    assert latest_run.report is not None
+    assert latest_run.report.drifts[0].category is DriftCategory.RECONCILIATION_RUN_FAILURE
+    assert quarantine_registry.is_quarantined(account_id="acct-77")
 
 
 def test_startup_reconciliation_persists_full_cycle_inputs_and_outcomes(

@@ -12,10 +12,15 @@ from auto_execution_engine.config.execution_mode import (
     SafetyGateConfig,
     validate_startup,
 )
-from auto_execution_engine.reconciliation.models import BrokerOrderSnapshot, ReconciliationReport
+from auto_execution_engine.reconciliation.models import (
+    BrokerOrderSnapshot,
+    ReconciliationReport,
+    ReconciliationRunRecord,
+)
 
 
 BrokerSnapshotByAccount = dict[str, list[BrokerOrderSnapshot]]
+from auto_execution_engine.reconciliation.runner import ReconciliationRunner
 from auto_execution_engine.reconciliation.service import (
     AccountQuarantineRegistry,
     ReconciliationService,
@@ -86,6 +91,34 @@ def build_account_lease_service(*, context: StartupContext) -> AccountLeaseServi
     return AccountLeaseService(backend=store.build_account_lease_backend())
 
 
+def build_reconciliation_runner(
+    *,
+    context: StartupContext,
+    order_store: SQLiteOrderStore | None = None,
+    lease_service: AccountLeaseService | None = None,
+    quarantine_registry: AccountQuarantineRegistry | None = None,
+    reconciliation_service: ReconciliationService | None = None,
+    owner_id: str = "startup-reconciliation-runner",
+    lease_ttl_seconds: int = 30,
+) -> ReconciliationRunner:
+    store = order_store or build_order_store(context=context)
+    leases = lease_service or build_account_lease_service(context=context)
+    registry = quarantine_registry or build_account_quarantine_registry(
+        context=context,
+        order_store=store,
+        preload_persisted_reports=True,
+    )
+    service = reconciliation_service or ReconciliationService()
+    return ReconciliationRunner(
+        order_store=store,
+        lease_service=leases,
+        quarantine_registry=registry,
+        reconciliation_service=service,
+        owner_id=owner_id,
+        lease_ttl_seconds=lease_ttl_seconds,
+    )
+
+
 def build_account_quarantine_registry(
     *,
     context: StartupContext | None = None,
@@ -149,32 +182,15 @@ def reconcile_all_startup_accounts(
     reconciliation_service: ReconciliationService | None = None,
     quarantine_registry: AccountQuarantineRegistry | None = None,
 ) -> list[ReconciliationReport]:
-    store = order_store or build_order_store(context=context)
-    reports: list[ReconciliationReport] = []
-
-    account_ids = set(store.list_accounts_requiring_reconciliation())
-    account_ids.update(store.list_accounts_with_reconciliation_reports())
-
-    for account_id in sorted(account_ids):
-        store.repair_orders_from_submissions(account_id=account_id)
-
-    account_ids = set(store.list_accounts_requiring_reconciliation())
-    account_ids.update(store.list_accounts_with_reconciliation_reports())
-
-    for account_id in sorted(account_ids):
-        reports.append(
-            reconcile_account_startup_state(
-                context=context,
-                account_id=account_id,
-                broker_orders=broker_snapshots_by_account.get(account_id, []),
-                order_store=store,
-                reconciliation_service=reconciliation_service,
-                quarantine_registry=quarantine_registry,
-                persist_report=True,
-            )
-        )
-
-    return reports
+    runner = build_reconciliation_runner(
+        context=context,
+        order_store=order_store,
+        quarantine_registry=quarantine_registry,
+        reconciliation_service=reconciliation_service,
+        owner_id="startup-reconciliation-runner",
+    )
+    records = runner.run_once(broker_snapshots_by_account=broker_snapshots_by_account)
+    return [record.report for record in records if record.report is not None]
 
 
 def load_startup_context() -> StartupContext:

@@ -28,6 +28,8 @@ from auto_execution_engine.reconciliation.models import (
     ReconciliationAction,
     ReconciliationDrift,
     ReconciliationReport,
+    ReconciliationRunRecord,
+    ReconciliationRunStatus,
 )
 
 
@@ -261,6 +263,49 @@ def test_order_store_persists_reconciliation_cycle_inputs_and_latest_report(
     assert latest_cycle.internal_orders == tuple(internal_orders)
     assert latest_cycle.broker_orders == tuple(broker_orders)
     assert cycles == [latest_cycle]
+
+
+def test_order_store_persists_reconciliation_run_records_across_restart(
+    db_path: Path,
+) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+    report = ReconciliationReport(
+        account_id="acct-1",
+        generated_at=datetime(2026, 1, 3, tzinfo=UTC),
+        action=ReconciliationAction.NO_ACTION,
+        drifts=(),
+    )
+    completed = ReconciliationRunRecord(
+        run_id="run-1",
+        account_id="acct-1",
+        owner_id="runner-a",
+        started_at=datetime(2026, 1, 3, 0, 0, 0, tzinfo=UTC),
+        completed_at=datetime(2026, 1, 3, 0, 0, 0, tzinfo=UTC),
+        status=ReconciliationRunStatus.COMPLETED,
+        detail="reconciliation completed without drift",
+        report=report,
+    )
+    skipped = ReconciliationRunRecord(
+        run_id="run-2",
+        account_id="acct-1",
+        owner_id="runner-b",
+        started_at=datetime(2026, 1, 3, 0, 1, 0, tzinfo=UTC),
+        completed_at=datetime(2026, 1, 3, 0, 1, 0, tzinfo=UTC),
+        status=ReconciliationRunStatus.SKIPPED,
+        detail="account acct-1 is already controlled by runner-a",
+        report=None,
+    )
+
+    store.record_reconciliation_run(record=completed)
+    store.record_reconciliation_run(record=skipped)
+
+    restarted_store = SQLiteOrderStore(db_path=db_path)
+    assert restarted_store.load_latest_reconciliation_run(account_id="acct-1") == skipped
+    assert restarted_store.list_reconciliation_runs(account_id="acct-1") == [
+        completed,
+        skipped,
+    ]
 
 
 def test_submission_book_persists_registered_submission_across_restart(db_path: Path) -> None:
