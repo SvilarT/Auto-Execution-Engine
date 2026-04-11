@@ -5,6 +5,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from auto_execution_engine.adapters.broker.models import (
+    BrokerRetryDisposition,
+    BrokerSubmissionOutcome,
+)
 from auto_execution_engine.adapters.broker.service import (
     BrokerOrderRequest,
     DuplicateSubmissionError,
@@ -226,6 +230,23 @@ class _SQLiteStore:
             )
             """
         )
+        existing_submission_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(submission_records)"
+            ).fetchall()
+        }
+        if "outcome" not in existing_submission_columns:
+            connection.execute(
+                "ALTER TABLE submission_records ADD COLUMN outcome TEXT NOT NULL DEFAULT 'accepted'"
+            )
+            connection.execute(
+                "UPDATE submission_records SET outcome = CASE accepted WHEN 1 THEN 'accepted' ELSE 'unknown' END"
+            )
+        if "retry_disposition" not in existing_submission_columns:
+            connection.execute(
+                "ALTER TABLE submission_records ADD COLUMN retry_disposition TEXT NOT NULL DEFAULT 'do_not_retry'"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_submission_records_account ON submission_records(account_id, client_order_id)"
         )
@@ -838,7 +859,7 @@ class SQLiteSubmissionBook(_SQLiteStore):
         with self._connect() as connection:
             self._initialize_schema(connection)
 
-    def mark_submitted(
+    def record_submission(
         self, *, request: BrokerOrderRequest, submission: RegisteredSubmission
     ) -> None:
         try:
@@ -851,15 +872,19 @@ class SQLiteSubmissionBook(_SQLiteStore):
                         account_id,
                         broker_order_id,
                         accepted,
+                        outcome,
+                        retry_disposition,
                         message,
                         recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         request.client_order_id,
                         request.account_id,
-                        submission.broker_order_id,
+                        submission.broker_order_id or "",
                         1 if submission.accepted else 0,
+                        submission.outcome.value,
+                        submission.retry_disposition.value,
                         submission.message,
                         datetime.now(UTC).isoformat(),
                     ),
@@ -869,12 +894,24 @@ class SQLiteSubmissionBook(_SQLiteStore):
                 f"client order {request.client_order_id} has already been submitted"
             ) from exc
 
+    def mark_submitted(
+        self, *, request: BrokerOrderRequest, submission: RegisteredSubmission
+    ) -> None:
+        self.record_submission(request=request, submission=submission)
+
     def load_submission(self, *, client_order_id: str) -> RegisteredSubmission | None:
         with self._connect() as connection:
             self._initialize_schema(connection)
             row = connection.execute(
                 """
-                SELECT account_id, client_order_id, broker_order_id, accepted, message
+                SELECT
+                    account_id,
+                    client_order_id,
+                    broker_order_id,
+                    accepted,
+                    outcome,
+                    retry_disposition,
+                    message
                 FROM submission_records
                 WHERE client_order_id = ?
                 """,
@@ -884,11 +921,20 @@ class SQLiteSubmissionBook(_SQLiteStore):
         if row is None:
             return None
 
+        outcome = row["outcome"]
+        if outcome is None:
+            outcome = "accepted" if bool(row["accepted"]) else "unknown"
+
+        broker_order_id = row["broker_order_id"]
+        if broker_order_id == "":
+            broker_order_id = None
+
         return RegisteredSubmission(
             account_id=row["account_id"],
             client_order_id=row["client_order_id"],
-            broker_order_id=row["broker_order_id"],
-            accepted=bool(row["accepted"]),
+            broker_order_id=broker_order_id,
+            outcome=BrokerSubmissionOutcome(outcome),
+            retry_disposition=BrokerRetryDisposition(row["retry_disposition"]),
             message=row["message"],
         )
 
@@ -914,6 +960,7 @@ class SQLiteAccountLeaseBackend(_SQLiteStore):
 
         with self._connect() as connection:
             self._initialize_schema(connection)
+            connection.commit()
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
@@ -987,6 +1034,7 @@ class SQLiteAccountLeaseBackend(_SQLiteStore):
 
         with self._connect() as connection:
             self._initialize_schema(connection)
+            connection.commit()
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
@@ -1087,12 +1135,25 @@ class SQLiteOrderStore:
             order = self.load_order(client_order_id=entry.client_order_id)
             recovery_events: list[DomainEvent] = []
 
-            if order.status is OrderStatus.CREATED:
+            if order.status is OrderStatus.CREATED and submission.outcome in {
+                BrokerSubmissionOutcome.ACCEPTED,
+                BrokerSubmissionOutcome.REJECTED,
+                BrokerSubmissionOutcome.UNKNOWN,
+            }:
                 order, risk_event = order.transition(OrderStatus.RISK_APPROVED)
                 recovery_events.append(risk_event)
-            if order.status is OrderStatus.RISK_APPROVED:
+            if (
+                order.status is OrderStatus.RISK_APPROVED
+                and submission.outcome is BrokerSubmissionOutcome.ACCEPTED
+            ):
                 order, submitted_event = order.transition(OrderStatus.SUBMITTED)
                 recovery_events.append(submitted_event)
+            elif (
+                order.status is OrderStatus.RISK_APPROVED
+                and submission.outcome is BrokerSubmissionOutcome.REJECTED
+            ):
+                order, rejected_event = order.transition(OrderStatus.REJECTED)
+                recovery_events.append(rejected_event)
 
             if not recovery_events:
                 continue

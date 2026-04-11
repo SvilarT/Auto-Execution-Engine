@@ -1,9 +1,16 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from auto_execution_engine.adapters.broker.models import (
+    BrokerOrderAck,
+    BrokerSubmissionOutcome,
+)
 from auto_execution_engine.adapters.broker.service import (
     BrokerOrderRequestBuilder,
     BrokerSubmissionService,
+    RetryableBrokerSubmissionError,
+    TerminalBrokerSubmissionError,
+    UnknownBrokerSubmissionError,
 )
 from auto_execution_engine.domain.events.models import DomainEvent
 from auto_execution_engine.domain.orders.models import OrderAggregate, OrderStatus
@@ -70,21 +77,32 @@ class ExecutionApplicationService:
         recovered_submission = self._broker_submission_service.load_submission(
             client_order_id=order.client_order_id
         )
-        if recovered_submission is not None and order.status is not OrderStatus.SUBMITTED:
+        if recovered_submission is not None:
             lease = self._acquire_execution_lease(
                 existing_lease=existing_lease,
                 account_id=order.account_id,
                 owner_id=owner_id,
             )
-            repaired_order, recovery_events = self._recover_submitted_order(order=order)
+            repaired_order, recovery_events = self._recover_order_from_submission(
+                order=order,
+                submission=recovered_submission,
+            )
             if recovery_events and self._order_store is not None:
                 self._order_store.record_events(events=recovery_events)
-            return ExecutionResult(
-                order=repaired_order,
-                events=recovery_events,
-                broker_order_id=recovered_submission.broker_order_id,
-                lease=lease,
+            if recovered_submission.outcome is BrokerSubmissionOutcome.ACCEPTED:
+                return ExecutionResult(
+                    order=repaired_order,
+                    events=recovery_events,
+                    broker_order_id=recovered_submission.broker_order_id or "",
+                    lease=lease,
+                )
+            raise ExecutionRejectedError(
+                self._message_for_nonaccepted_submission(
+                    client_order_id=order.client_order_id,
+                    submission=recovered_submission,
+                )
             )
+
         if order.status is not OrderStatus.CREATED:
             raise ExecutionRejectedError(
                 "order "
@@ -114,7 +132,36 @@ class ExecutionApplicationService:
 
         risk_approved_order, risk_event = order.transition(OrderStatus.RISK_APPROVED)
         broker_request = self._broker_request_builder.build(order=risk_approved_order)
-        broker_ack = self._broker_submission_service.register_submission(request=broker_request)
+
+        try:
+            broker_ack = self._broker_submission_service.register_submission(
+                request=broker_request
+            )
+        except RetryableBrokerSubmissionError as exc:
+            raise ExecutionRejectedError(
+                f"broker submission for order {order.client_order_id} failed safely and may be retried: {exc}"
+            ) from exc
+        except TerminalBrokerSubmissionError as exc:
+            recovered_order, recovery_events = self._recover_order_from_submission(
+                order=order,
+                submission=exc.submission.to_ack(),
+            )
+            if recovery_events and self._order_store is not None:
+                self._order_store.record_events(events=recovery_events)
+            raise ExecutionRejectedError(
+                f"broker rejected order {order.client_order_id}: {exc}"
+            ) from exc
+        except UnknownBrokerSubmissionError as exc:
+            recovered_order, recovery_events = self._recover_order_from_submission(
+                order=order,
+                submission=exc.submission.to_ack(),
+            )
+            if recovery_events and self._order_store is not None:
+                self._order_store.record_events(events=recovery_events)
+            raise ExecutionRejectedError(
+                f"broker submission outcome for order {order.client_order_id} is unknown and cannot be retried safely: {exc}"
+            ) from exc
+
         submitted_order, submitted_event = risk_approved_order.transition(OrderStatus.SUBMITTED)
 
         if self._order_store is not None:
@@ -123,7 +170,7 @@ class ExecutionApplicationService:
         return ExecutionResult(
             order=submitted_order,
             events=[risk_event, submitted_event],
-            broker_order_id=broker_ack.broker_order_id,
+            broker_order_id=broker_ack.broker_order_id or "",
             lease=lease,
         )
 
@@ -148,19 +195,43 @@ class ExecutionApplicationService:
         except LeaseError as exc:
             raise ExecutionRejectedError(str(exc)) from exc
 
-    def _recover_submitted_order(
-        self, *, order: OrderAggregate
+    def _recover_order_from_submission(
+        self, *, order: OrderAggregate, submission: BrokerOrderAck
     ) -> tuple[OrderAggregate, list[DomainEvent]]:
         recovery_events: list[DomainEvent] = []
 
-        if order.status is OrderStatus.CREATED:
+        if order.status is OrderStatus.CREATED and submission.outcome in {
+            BrokerSubmissionOutcome.ACCEPTED,
+            BrokerSubmissionOutcome.REJECTED,
+            BrokerSubmissionOutcome.UNKNOWN,
+        }:
             order, risk_event = order.transition(OrderStatus.RISK_APPROVED)
             recovery_events.append(risk_event)
-        if order.status is OrderStatus.RISK_APPROVED:
+
+        if (
+            submission.outcome is BrokerSubmissionOutcome.ACCEPTED
+            and order.status is OrderStatus.RISK_APPROVED
+        ):
             order, submitted_event = order.transition(OrderStatus.SUBMITTED)
             recovery_events.append(submitted_event)
+        elif (
+            submission.outcome is BrokerSubmissionOutcome.REJECTED
+            and order.status is OrderStatus.RISK_APPROVED
+        ):
+            order, rejected_event = order.transition(OrderStatus.REJECTED)
+            recovery_events.append(rejected_event)
 
         return order, recovery_events
+
+    def _message_for_nonaccepted_submission(
+        self, *, client_order_id: str, submission: BrokerOrderAck
+    ) -> str:
+        if submission.outcome is BrokerSubmissionOutcome.REJECTED:
+            return f"broker rejected order {client_order_id}: {submission.message}"
+        return (
+            f"broker submission outcome for order {client_order_id} is unknown and "
+            f"cannot be retried safely: {submission.message}"
+        )
 
     def _ensure_account_execution_allowed(self, *, account_id: str) -> None:
         if self._account_execution_gate is None:

@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from auto_execution_engine.adapters.broker.models import BrokerOrderRequest, BrokerOrderSide, BrokerOrderType
+from auto_execution_engine.adapters.broker.models import (
+    BrokerOrderRequest,
+    BrokerOrderSide,
+    BrokerOrderType,
+    BrokerRetryDisposition,
+    BrokerSubmissionOutcome,
+)
 from auto_execution_engine.adapters.broker.service import RegisteredSubmission
 from auto_execution_engine.adapters.persistence.sqlite_order_store import (
     DuplicateEventError,
@@ -359,6 +365,66 @@ def test_submission_book_rejects_duplicate_registered_submission_across_restart(
     restarted_book = SQLiteSubmissionBook(db_path=db_path)
     with pytest.raises(ValueError, match="already been submitted"):
         restarted_book.mark_submitted(request=request, submission=submission)
+
+
+def test_submission_book_persists_terminal_rejection_across_restart(db_path: Path) -> None:
+    book = SQLiteSubmissionBook(db_path=db_path)
+    book.initialize()
+    request = BrokerOrderRequest(
+        account_id="acct-1",
+        client_order_id="client-rejected",
+        symbol="AAPL",
+        side=BrokerOrderSide.BUY,
+        quantity=10,
+        order_type=BrokerOrderType.MARKET,
+    )
+    submission = RegisteredSubmission(
+        account_id="acct-1",
+        client_order_id="client-rejected",
+        broker_order_id=None,
+        outcome=BrokerSubmissionOutcome.REJECTED,
+        retry_disposition=BrokerRetryDisposition.DO_NOT_RETRY,
+        message="venue rejected the order",
+    )
+
+    book.mark_submitted(request=request, submission=submission)
+
+    restarted_book = SQLiteSubmissionBook(db_path=db_path)
+    recovered = restarted_book.load_submission(client_order_id="client-rejected")
+    assert recovered == submission
+    assert recovered is not None
+    assert recovered.accepted is False
+    assert recovered.outcome is BrokerSubmissionOutcome.REJECTED
+
+
+def test_submission_book_persists_unknown_outcome_across_restart(db_path: Path) -> None:
+    book = SQLiteSubmissionBook(db_path=db_path)
+    book.initialize()
+    request = BrokerOrderRequest(
+        account_id="acct-1",
+        client_order_id="client-unknown",
+        symbol="AAPL",
+        side=BrokerOrderSide.BUY,
+        quantity=10,
+        order_type=BrokerOrderType.MARKET,
+    )
+    submission = RegisteredSubmission(
+        account_id="acct-1",
+        client_order_id="client-unknown",
+        broker_order_id=None,
+        outcome=BrokerSubmissionOutcome.UNKNOWN,
+        retry_disposition=BrokerRetryDisposition.DO_NOT_RETRY,
+        message="broker receipt could not be confirmed",
+    )
+
+    book.mark_submitted(request=request, submission=submission)
+
+    restarted_book = SQLiteSubmissionBook(db_path=db_path)
+    recovered = restarted_book.load_submission(client_order_id="client-unknown")
+    assert recovered == submission
+    assert recovered is not None
+    assert recovered.accepted is False
+    assert recovered.outcome is BrokerSubmissionOutcome.UNKNOWN
 
 
 def test_account_lease_backend_persists_and_renews_same_owner_across_restart(

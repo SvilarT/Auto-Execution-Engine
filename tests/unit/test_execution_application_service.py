@@ -3,10 +3,15 @@ from pathlib import Path
 
 import pytest
 
+from auto_execution_engine.adapters.broker.models import (
+    BrokerRetryDisposition,
+    BrokerSubmissionOutcome,
+)
 from auto_execution_engine.adapters.broker.service import (
     BrokerOrderRequestBuilder,
     BrokerSubmissionService,
     IdempotentSubmissionBook,
+    RegisteredSubmission,
 )
 from auto_execution_engine.adapters.persistence.sqlite_order_store import (
     SQLiteAccountLeaseBackend,
@@ -28,6 +33,15 @@ from auto_execution_engine.reconciliation.models import (
 )
 from auto_execution_engine.reconciliation.service import AccountQuarantineRegistry
 from auto_execution_engine.trading_plane.leases import AccountLease, AccountLeaseService
+
+
+class StaticSubmitter:
+    def __init__(self, submission: RegisteredSubmission) -> None:
+        self._submission = submission
+
+    def submit(self, *, request):
+        del request
+        return self._submission
 
 
 def make_order() -> OrderAggregate:
@@ -309,3 +323,167 @@ def test_execution_service_uses_durable_account_lease_across_restart(db_path: Pa
             owner_id="worker-b",
             existing_lease=first_lease,
         )
+
+
+def test_execution_service_persists_terminal_broker_rejection_for_restart_safe_recovery(
+    db_path: Path,
+) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    order = make_order()
+    submission = RegisteredSubmission(
+        account_id=order.account_id,
+        client_order_id=order.client_order_id,
+        broker_order_id=None,
+        outcome=BrokerSubmissionOutcome.REJECTED,
+        retry_disposition=BrokerRetryDisposition.DO_NOT_RETRY,
+        message="broker rejected the order at venue validation",
+    )
+    service = make_service(
+        order_store=order_store,
+        broker_submission_service=BrokerSubmissionService(
+            submission_book=SQLiteSubmissionBook(db_path=db_path),
+            submitter=StaticSubmitter(submission),
+        ),
+    )
+
+    with pytest.raises(
+        ExecutionRejectedError,
+        match="broker rejected order .* venue validation",
+    ):
+        service.execute_order(
+            order=order,
+            strategy_id="strat-a",
+            reference_price=50_000,
+            kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+            owner_id="worker-a",
+            existing_lease=None,
+        )
+
+    recovered_order = order_store.load_order(client_order_id=order.client_order_id)
+    assert recovered_order.status is OrderStatus.REJECTED
+
+    restarted_service = make_service(
+        order_store=SQLiteOrderStore(db_path=db_path),
+        broker_submission_service=BrokerSubmissionService(
+            submission_book=SQLiteSubmissionBook(db_path=db_path)
+        ),
+    )
+    with pytest.raises(ExecutionRejectedError, match="broker rejected order"):
+        restarted_service.execute_order(
+            order=order,
+            strategy_id="strat-a",
+            reference_price=50_000,
+            kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+            owner_id="worker-a",
+            existing_lease=None,
+        )
+
+
+def test_execution_service_recovers_unknown_broker_outcome_without_resubmitting(
+    db_path: Path,
+) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    order = make_order()
+    submission = RegisteredSubmission(
+        account_id=order.account_id,
+        client_order_id=order.client_order_id,
+        broker_order_id=None,
+        outcome=BrokerSubmissionOutcome.UNKNOWN,
+        retry_disposition=BrokerRetryDisposition.DO_NOT_RETRY,
+        message="broker receipt could not be confirmed",
+    )
+    submission_service = BrokerSubmissionService(
+        submission_book=SQLiteSubmissionBook(db_path=db_path),
+        submitter=StaticSubmitter(submission),
+    )
+    service = make_service(
+        order_store=order_store,
+        broker_submission_service=submission_service,
+    )
+
+    with pytest.raises(
+        ExecutionRejectedError,
+        match="unknown and cannot be retried safely",
+    ):
+        service.execute_order(
+            order=order,
+            strategy_id="strat-a",
+            reference_price=50_000,
+            kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+            owner_id="worker-a",
+            existing_lease=None,
+        )
+
+    recovered_order = order_store.load_order(client_order_id=order.client_order_id)
+    assert recovered_order.status is OrderStatus.RISK_APPROVED
+
+    restarted_service = make_service(
+        order_store=SQLiteOrderStore(db_path=db_path),
+        broker_submission_service=BrokerSubmissionService(
+            submission_book=SQLiteSubmissionBook(db_path=db_path)
+        ),
+    )
+    with pytest.raises(
+        ExecutionRejectedError,
+        match="unknown and cannot be retried safely",
+    ):
+        restarted_service.execute_order(
+            order=order,
+            strategy_id="strat-a",
+            reference_price=50_000,
+            kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+            owner_id="worker-a",
+            existing_lease=None,
+        )
+
+
+def test_execution_service_allows_retry_after_explicitly_safe_broker_failure(db_path: Path) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    order = make_order()
+    retryable_failure = RegisteredSubmission(
+        account_id=order.account_id,
+        client_order_id=order.client_order_id,
+        broker_order_id=None,
+        outcome=BrokerSubmissionOutcome.FAILED,
+        retry_disposition=BrokerRetryDisposition.SAFE_TO_RETRY,
+        message="transport dropped before broker receipt was confirmed",
+    )
+    retry_service = make_service(
+        order_store=order_store,
+        broker_submission_service=BrokerSubmissionService(
+            submission_book=SQLiteSubmissionBook(db_path=db_path),
+            submitter=StaticSubmitter(retryable_failure),
+        ),
+    )
+
+    with pytest.raises(ExecutionRejectedError, match="failed safely and may be retried"):
+        retry_service.execute_order(
+            order=order,
+            strategy_id="strat-a",
+            reference_price=50_000,
+            kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+            owner_id="worker-a",
+            existing_lease=None,
+        )
+
+    restarted_service = make_service(
+        order_store=SQLiteOrderStore(db_path=db_path),
+        broker_submission_service=BrokerSubmissionService(
+            submission_book=SQLiteSubmissionBook(db_path=db_path)
+        ),
+    )
+    result = restarted_service.execute_order(
+        order=order,
+        strategy_id="strat-a",
+        reference_price=50_000,
+        kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+        owner_id="worker-a",
+        existing_lease=None,
+    )
+
+    recovered_order = order_store.load_order(client_order_id=order.client_order_id)
+    assert result.order.status is OrderStatus.SUBMITTED
+    assert recovered_order.status is OrderStatus.SUBMITTED
