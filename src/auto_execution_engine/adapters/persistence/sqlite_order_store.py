@@ -22,6 +22,7 @@ from auto_execution_engine.domain.orders.models import (
     OrderStatus,
     OrderType,
 )
+from auto_execution_engine.domain.risk.models import AccountExposureSnapshot
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
     CashSnapshot,
@@ -1323,6 +1324,18 @@ class SQLiteOrderStore:
             account_id=account_id,
             events=replay_events,
             opening_balance=opening_balance,
+        )
+
+    def project_internal_exposure(
+        self,
+        *,
+        account_id: str,
+        events: Iterable[DomainEvent] | None = None,
+    ) -> AccountExposureSnapshot:
+        replay_events = list(events) if events is not None else self.list_events(account_id=account_id)
+        return self._projection_service.rebuild_exposure(
+            account_id=account_id,
+            events=replay_events,
         )
 
     def repair_orders_from_submissions(self, *, account_id: str | None = None) -> list[str]:

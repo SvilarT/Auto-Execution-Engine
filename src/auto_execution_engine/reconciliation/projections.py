@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from auto_execution_engine.domain.events.models import DomainEvent, EventType
 from auto_execution_engine.domain.orders.models import OrderSide
+from auto_execution_engine.domain.risk.models import AccountExposureSnapshot, SymbolExposureSnapshot
 from auto_execution_engine.reconciliation.models import CashSnapshot, PositionSnapshot
 
 
@@ -29,7 +30,7 @@ class _FillDelta:
 
 
 class EventLogProjectionService:
-    """Rebuild deterministic account-level position and cash state from recorded events."""
+    """Rebuild deterministic account-level position, cash, and exposure state from recorded events."""
 
     def rebuild_positions(
         self,
@@ -70,6 +71,43 @@ class EventLogProjectionService:
                 balance += notional
 
         return CashSnapshot(account_id=account_id, balance=balance)
+
+    def rebuild_exposure(
+        self,
+        *,
+        account_id: str,
+        events: Iterable[DomainEvent],
+    ) -> AccountExposureSnapshot:
+        quantities_by_symbol: dict[str, float] = {}
+        last_price_by_symbol: dict[str, float] = {}
+
+        for fill in self._iter_fill_deltas(events=events, account_id=account_id):
+            signed_quantity = fill.quantity_delta
+            if fill.side is OrderSide.SELL:
+                signed_quantity *= -1.0
+            quantities_by_symbol[fill.symbol] = quantities_by_symbol.get(fill.symbol, 0.0) + signed_quantity
+            last_price_by_symbol[fill.symbol] = fill.price
+
+        symbol_exposures: list[SymbolExposureSnapshot] = []
+        for symbol, quantity in sorted(quantities_by_symbol.items()):
+            if abs(quantity) <= 1e-9:
+                continue
+            mark_price = last_price_by_symbol[symbol]
+            symbol_exposures.append(
+                SymbolExposureSnapshot(
+                    account_id=account_id,
+                    symbol=symbol,
+                    quantity=quantity,
+                    mark_price=mark_price,
+                    gross_notional=abs(quantity) * mark_price,
+                )
+            )
+
+        return AccountExposureSnapshot(
+            account_id=account_id,
+            gross_notional=sum(exposure.gross_notional for exposure in symbol_exposures),
+            symbol_exposures=tuple(symbol_exposures),
+        )
 
     def _iter_fill_deltas(
         self,

@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from auto_execution_engine.adapters.broker.models import (
@@ -13,9 +15,14 @@ from auto_execution_engine.adapters.broker.service import (
     TerminalBrokerSubmissionError,
     UnknownBrokerSubmissionError,
 )
-from auto_execution_engine.domain.events.models import DomainEvent
+from auto_execution_engine.domain.events.models import DomainEvent, EventType
 from auto_execution_engine.domain.orders.models import OrderAggregate, OrderFill, OrderStatus
-from auto_execution_engine.domain.risk.models import KillSwitch, OrderIntent, RiskDecision
+from auto_execution_engine.domain.risk.models import (
+    AccountExposureSnapshot,
+    KillSwitch,
+    OrderIntent,
+    RiskDecision,
+)
 from auto_execution_engine.domain.risk.service import RiskService
 from auto_execution_engine.reconciliation.models import CashSnapshot, PositionSnapshot
 from auto_execution_engine.reconciliation.service import ReconciliationQuarantineError
@@ -44,6 +51,8 @@ class DurableOrderStore(Protocol):
         account_id: str,
         opening_balance: float = 0.0,
     ) -> CashSnapshot: ...
+
+    def project_internal_exposure(self, *, account_id: str) -> AccountExposureSnapshot: ...
 
 
 class AccountExecutionGate(Protocol):
@@ -142,8 +151,20 @@ class ExecutionApplicationService:
             notional=order.quantity * reference_price,
             strategy_id=strategy_id,
         )
-        decision = self._risk_service.evaluate(intent=intent, kill_switch=kill_switch)
+        decision = self._risk_service.evaluate(
+            intent=intent,
+            kill_switch=kill_switch,
+            current_exposure=self._load_current_exposure(account_id=order.account_id),
+        )
         if decision.decision is not RiskDecision.APPROVE:
+            rejection_event = self._build_risk_event(
+                order=order,
+                strategy_id=strategy_id,
+                decision=decision,
+                approved=False,
+            )
+            if self._order_store is not None:
+                self._order_store.record_events(events=[rejection_event])
             raise ExecutionRejectedError(
                 f"risk rejected order {order.client_order_id}: {decision.reason_code}"
             )
@@ -154,7 +175,13 @@ class ExecutionApplicationService:
             owner_id=owner_id,
         )
 
-        risk_approved_order, risk_event = order.transition(OrderStatus.RISK_APPROVED)
+        risk_approved_order, _ = order.transition(OrderStatus.RISK_APPROVED)
+        risk_event = self._build_risk_event(
+            order=order,
+            strategy_id=strategy_id,
+            decision=decision,
+            approved=True,
+        )
         broker_request = self._broker_request_builder.build(order=risk_approved_order)
 
         try:
@@ -233,6 +260,45 @@ class ExecutionApplicationService:
             raise ExecutionRejectedError(str(exc)) from exc
 
         return FillIngestionResult(order=order, event=event)
+
+    def _load_current_exposure(self, *, account_id: str) -> AccountExposureSnapshot | None:
+        if self._order_store is None:
+            return None
+        return self._order_store.project_internal_exposure(account_id=account_id)
+
+    def _build_risk_event(
+        self,
+        *,
+        order: OrderAggregate,
+        strategy_id: str,
+        decision,
+        approved: bool,
+    ) -> DomainEvent:
+        payload: dict[str, str | int | float | bool | None] = {
+            "client_order_id": order.client_order_id,
+            "account_id": order.account_id,
+            "symbol": order.symbol,
+            "side": order.side.value,
+            "quantity": order.quantity,
+            "order_type": order.order_type.value,
+            "status": (
+                OrderStatus.RISK_APPROVED.value if approved else OrderStatus.REJECTED.value
+            ),
+            "filled_quantity": order.filled_quantity,
+            "average_fill_price": order.average_fill_price,
+            "policy_name": decision.policy_name,
+            "policy_version": decision.policy_version,
+            "reason_code": decision.reason_code,
+        }
+        payload.update(decision.audit_details)
+        return DomainEvent(
+            event_type=EventType.RISK_APPROVED if approved else EventType.RISK_REJECTED,
+            aggregate_id=order.client_order_id,
+            account_id=order.account_id,
+            strategy_id=strategy_id,
+            occurred_at=datetime.now(UTC),
+            payload=payload,
+        )
 
     def _acquire_execution_lease(
         self,

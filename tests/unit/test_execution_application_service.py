@@ -570,3 +570,101 @@ def test_execution_service_allows_retry_after_explicitly_safe_broker_failure(db_
     recovered_order = order_store.load_order(client_order_id=order.client_order_id)
     assert result.order.status is OrderStatus.SUBMITTED
     assert recovered_order.status is OrderStatus.SUBMITTED
+
+
+def test_execution_service_persists_policy_metadata_on_risk_approval(db_path: Path) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    service = make_service(order_store=order_store)
+    order = make_order()
+
+    service.execute_order(
+        order=order,
+        strategy_id="strat-1",
+        reference_price=30_000,
+        kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+        owner_id="worker-a",
+        existing_lease=None,
+    )
+
+    persisted_events = order_store.list_events(aggregate_id=order.client_order_id)
+    risk_event = persisted_events[1]
+    assert risk_event.event_type.value == "risk_approved"
+    assert risk_event.payload["policy_name"] == "global_pre_trade_policy"
+    assert risk_event.payload["policy_version"] == "2"
+    assert risk_event.payload["reason_code"] == "approved"
+
+
+def test_execution_service_persists_risk_rejection_event_with_policy_metadata(
+    db_path: Path,
+) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    service = ExecutionApplicationService(
+        risk_service=RiskService(
+            limits=RiskLimits(
+                max_order_notional=100_000,
+                max_order_quantity=5,
+                max_account_gross_notional=50_000,
+                policy_version="9",
+            )
+        ),
+        lease_service=AccountLeaseService(),
+        broker_request_builder=BrokerOrderRequestBuilder(),
+        broker_submission_service=BrokerSubmissionService(
+            submission_book=IdempotentSubmissionBook()
+        ),
+        order_store=order_store,
+    )
+
+    first_order = make_order()
+    execution_result = service.execute_order(
+        order=first_order,
+        strategy_id="strat-1",
+        reference_price=30_000,
+        kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+        owner_id="worker-a",
+        existing_lease=None,
+    )
+    service.ingest_fill(
+        client_order_id=first_order.client_order_id,
+        fill_id="fill-1",
+        fill_quantity=1.0,
+        fill_price=30_000.0,
+        occurred_at=datetime(2026, 1, 5, tzinfo=UTC),
+        broker_order_id=execution_result.broker_order_id,
+    )
+
+    second_order = OrderAggregate(
+        account_id="acct-1",
+        symbol="ETH-USD",
+        side=OrderSide.BUY,
+        quantity=1.0,
+        order_type=OrderType.MARKET,
+    )
+
+    with pytest.raises(
+        ExecutionRejectedError,
+        match="account_gross_notional_limit_exceeded",
+    ):
+        service.execute_order(
+            order=second_order,
+            strategy_id="strat-2",
+            reference_price=25_000,
+            kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+            owner_id="worker-a",
+            existing_lease=None,
+        )
+
+    persisted_events = order_store.list_events(aggregate_id=second_order.client_order_id)
+    assert [event.event_type.value for event in persisted_events] == [
+        "order_created",
+        "risk_rejected",
+    ]
+    risk_rejected_event = persisted_events[1]
+    assert risk_rejected_event.payload["policy_name"] == "global_pre_trade_policy"
+    assert risk_rejected_event.payload["policy_version"] == "9"
+    assert (
+        risk_rejected_event.payload["reason_code"]
+        == "account_gross_notional_limit_exceeded"
+    )

@@ -26,11 +26,34 @@ class OrderIntent:
 
 
 @dataclass(frozen=True)
+class SymbolExposureSnapshot:
+    account_id: str
+    symbol: str
+    quantity: float
+    mark_price: float
+    gross_notional: float
+
+
+@dataclass(frozen=True)
+class AccountExposureSnapshot:
+    account_id: str
+    gross_notional: float = 0.0
+    symbol_exposures: tuple[SymbolExposureSnapshot, ...] = ()
+
+    def exposure_for_symbol(self, *, symbol: str) -> SymbolExposureSnapshot | None:
+        for exposure in self.symbol_exposures:
+            if exposure.symbol == symbol:
+                return exposure
+        return None
+
+
+@dataclass(frozen=True)
 class RiskPolicyDecision:
     decision: RiskDecision
     reason_code: str
     policy_name: str
     policy_version: str
+    audit_details: dict[str, str | float | int | bool | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
