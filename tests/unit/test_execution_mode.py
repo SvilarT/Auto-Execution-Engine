@@ -3,6 +3,7 @@ from pathlib import Path
 from auto_execution_engine.bootstrap.startup import (
     build_account_lease_service,
     build_account_quarantine_registry,
+    build_broker_submitter,
     build_order_store,
     build_reconciliation_runner,
     build_submission_service,
@@ -17,11 +18,13 @@ from datetime import UTC, datetime
 
 import pytest
 
+from auto_execution_engine.adapters.broker.alpaca import AlpacaBrokerSubmitter
 from auto_execution_engine.adapters.broker.models import (
     BrokerOrderRequest,
     BrokerOrderSide,
     BrokerOrderType,
 )
+from auto_execution_engine.adapters.broker.service import SyntheticBrokerSubmitter
 from auto_execution_engine.adapters.persistence.sqlite_order_store import SQLiteOrderStore
 from auto_execution_engine.config.execution_mode import ConfigurationError, ExecutionMode
 from auto_execution_engine.domain.orders.models import (
@@ -40,6 +43,13 @@ from auto_execution_engine.reconciliation.models import (
     ReconciliationRunRecord,
     ReconciliationRunStatus,
 )
+
+
+@pytest.fixture(autouse=True)
+def _set_default_alpaca_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("AEE_ALPACA_API_KEY_ID", "test-key")
+    monkeypatch.setenv("AEE_ALPACA_API_SECRET_KEY", "test-secret")
+
 
 
 def seed_promotion_evidence(
@@ -250,7 +260,10 @@ def test_startup_builds_durable_submission_service_from_runtime_namespace(
     seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
-    submission_service = build_submission_service(context=context)
+    submission_service = build_submission_service(
+        context=context,
+        submitter=SyntheticBrokerSubmitter(),
+    )
     first_ack = submission_service.register_submission(
         request=BrokerOrderRequest(
             account_id="acct-1",
@@ -261,7 +274,10 @@ def test_startup_builds_durable_submission_service_from_runtime_namespace(
             order_type=BrokerOrderType.MARKET,
         )
     )
-    restarted_submission_service = build_submission_service(context=context)
+    restarted_submission_service = build_submission_service(
+        context=context,
+        submitter=SyntheticBrokerSubmitter(),
+    )
     restarted_ack = restarted_submission_service.load_submission(
         client_order_id="startup-ord-1"
     )
@@ -335,7 +351,10 @@ def test_startup_reconciliation_repairs_created_order_from_durable_submission(
         client_order_id="startup-gap-1",
     )
     store.record_events(events=[order.create_event()])
-    build_submission_service(context=context).register_submission(
+    build_submission_service(
+        context=context,
+        submitter=SyntheticBrokerSubmitter(),
+    ).register_submission(
         request=BrokerOrderRequest(
             account_id="acct-1",
             client_order_id="startup-gap-1",
@@ -770,3 +789,26 @@ def test_live_mode_persists_approved_promotion_gate_decision(
     assert persisted_decision is not None
     assert persisted_decision.approved is True
     assert persisted_decision.source_mode is ExecutionMode.PAPER
+
+
+def test_paper_mode_builds_real_alpaca_submitter(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "paper")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
+
+    context = load_startup_context()
+    submitter = build_broker_submitter(context=context)
+
+    assert isinstance(submitter, AlpacaBrokerSubmitter)
+    assert context.broker_adapter_config is not None
+    assert context.broker_adapter_config.trading_base_url == "https://paper-api.alpaca.markets"
+    assert submitter.config == context.broker_adapter_config

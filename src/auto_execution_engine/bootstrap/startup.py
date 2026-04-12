@@ -3,7 +3,16 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from auto_execution_engine.adapters.broker.service import BrokerSubmissionService
+from auto_execution_engine.adapters.broker.alpaca import (
+    AlpacaBrokerSubmitter,
+    AlpacaTradingConfig,
+    load_alpaca_trading_config,
+)
+from auto_execution_engine.adapters.broker.service import (
+    BrokerSubmissionService,
+    BrokerSubmitter,
+    SyntheticBrokerSubmitter,
+)
 from auto_execution_engine.adapters.persistence.sqlite_order_store import SQLiteOrderStore
 from auto_execution_engine.application.execution_service import (
     OperatorControlService,
@@ -55,6 +64,7 @@ class StartupContext:
     safety: SafetyGateConfig
     durable_state_root: Path
     promotion_gate_decision: PromotionGateDecisionRecord | None = None
+    broker_adapter_config: AlpacaTradingConfig | None = None
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -109,9 +119,29 @@ def build_order_store(*, context: StartupContext) -> SQLiteOrderStore:
     return store
 
 
-def build_submission_service(*, context: StartupContext) -> BrokerSubmissionService:
+def build_broker_submitter(
+    *,
+    context: StartupContext,
+) -> BrokerSubmitter:
+    if context.profile.mode is ExecutionMode.SIMULATION:
+        return SyntheticBrokerSubmitter()
+    if context.broker_adapter_config is None:
+        raise ConfigurationError(
+            "paper and live modes require a validated broker adapter configuration"
+        )
+    return AlpacaBrokerSubmitter(config=context.broker_adapter_config)
+
+
+def build_submission_service(
+    *,
+    context: StartupContext,
+    submitter: BrokerSubmitter | None = None,
+) -> BrokerSubmissionService:
     store = build_order_store(context=context)
-    return BrokerSubmissionService(submission_book=store.build_submission_book())
+    return BrokerSubmissionService(
+        submission_book=store.build_submission_book(),
+        submitter=submitter or build_broker_submitter(context=context),
+    )
 
 
 def build_account_lease_service(*, context: StartupContext) -> AccountLeaseService:
@@ -359,6 +389,7 @@ def load_startup_context() -> StartupContext:
 
     durable_state_root = _read_durable_state_root()
     promotion_gate_decision: PromotionGateDecisionRecord | None = None
+    broker_adapter_config: AlpacaTradingConfig | None = None
     if mode is ExecutionMode.SIMULATION:
         profile = validate_startup(mode=mode, safety=safety)
     else:
@@ -368,10 +399,12 @@ def load_startup_context() -> StartupContext:
             durable_state_root=durable_state_root,
         )
         profile = get_runtime_profile(mode)
+        broker_adapter_config = load_alpaca_trading_config(mode=mode)
 
     return StartupContext(
         profile=profile,
         safety=safety,
         durable_state_root=durable_state_root,
         promotion_gate_decision=promotion_gate_decision,
+        broker_adapter_config=broker_adapter_config,
     )
