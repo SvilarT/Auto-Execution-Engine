@@ -2,13 +2,17 @@
 
 ## Current Baseline
 
-The repository now has a stronger durable coordination substrate than the earlier foundation review reflected. The following milestones are already completed and committed on `main`:
+The repository now has a stronger durable coordination substrate than the earlier foundation review reflected. The following milestones are already completed and committed on `main`, including the recently finished fill-ingestion milestone:
 
 | Step | Commit | Outcome |
 |---|---|---|
 | **1** | `13e3857` | Durable SQLite-backed account lease ownership, durable broker submission deduplication, startup wiring, and restart-safety tests |
 | **2** | `7dd9576` | Crash-gap repair from durable submission records during execution retry and startup reconciliation |
 | **3** | `608f818` | Explicit lease release semantics with immediate ownership handoff coverage |
+| **4** | `d0918bb` | Durable reconciliation-cycle journal with persisted broker/internal truth, drift sets, and replayable outcomes |
+| **5** | `54a11f2` | Recurring reconciliation runner with fail-closed account handling and duplicate-run protection |
+| **6** | `cf1a402` | Explicit broker submission outcome taxonomy with retry-safe rejection, timeout, and unknown-result handling |
+| **7** | `b14f07a` | Durable fill ingestion, deterministic post-submit order progression, replay-safe duplicate fill handling, and restart-safe fill recovery tests |
 
 The system is still **not paper-ready or live-ready**, but it now has materially better restart safety for execution coordination.
 
@@ -18,10 +22,6 @@ The remaining work should be executed in the following order. Each step is inten
 
 | Priority | Step | Why it comes next | Expected output |
 |---|---|---|---|
-| **4** | **Persist reconciliation inputs and outcomes as an operational journal** | Reconciliation logic exists, but there is still no durable record of what broker truth was observed, what drifts were detected, and what action was taken at each checkpoint | Broker snapshot journal, persisted reconciliation cycle metadata, replayable reconciliation history, and tests for restart-safe report retrieval |
-| **5** | **Add a recurring reconciliation runner with fail-closed account handling** | Drift logic is only as useful as the loop that executes it regularly; the system still lacks an operational heartbeat that keeps internal truth aligned with broker truth | Scheduled or poll-driven reconciliation orchestration, duplicate-run protection, quarantine propagation, and integration-style tests |
-| **6** | **Implement broker-facing failure taxonomy and retry-safe submission outcomes** | Durable deduplication now exists, but broker interaction semantics are still synthetic; transport failure, timeout, rejection, and partial-acceptance cases must become explicit | Broker error/result model, retry classification, timeout handling, deterministic persistence of rejected/unknown outcomes, and tests |
-| **7** | **Add fill ingestion and deterministic post-submit order progression** | The platform can submit orders, but it cannot yet consume real or simulated downstream fills as first-class persisted events | Fill event ingestion path, order progression from submitted to partial/full fill, replay-safe projections, and reconciliation alignment tests |
 | **8** | **Introduce position and cash projections rebuilt from the event log** | Order truth alone is insufficient for trading safety; exposure, cash, and position state must be reconstructable after crashes | Rebuildable projections, replay routines, persistence tests, and cross-checks against reconciliation inputs |
 | **9** | **Strengthen the risk layer with aggregated exposure and policy versioning** | The current risk authority is structurally correct but still too minimal for serious paper or live operation | Versioned policy evaluation, concentration and notional limits, account-level exposure aggregation, audit logging, and tests |
 | **10** | **Add observability and operator control surfaces** | Safe runtime operation requires explainability under failure, not just correct code paths | Structured logs, metrics, health summaries, quarantine/operator action history, and clear runtime diagnostics |
@@ -56,4 +56,4 @@ Each remaining step should continue to follow the same operating discipline used
 
 ## Immediate Next Target
 
-The next highest-value build target is **Step 4: persist reconciliation inputs and outcomes as an operational journal**. It is the natural continuation after durable submission recovery because it makes post-restart diagnosis, drift explanation, and operational auditability materially stronger.
+The next highest-value build target is **Step 8: introduce position and cash projections rebuilt from the event log**. Now that durable submission outcomes and downstream fill ingestion are persisted, the next gap is reconstructable exposure state after crashes and restarts. Position and cash projections are the missing bridge between durable order truth and trading-safe account state.
