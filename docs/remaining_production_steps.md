@@ -25,7 +25,7 @@ The remaining work should be executed in the following order. Each step is inten
 | Priority | Step | Why it comes next | Expected output |
 |---|---|---|---|
 | **10** | **Add observability and operator control surfaces** | Completed in commit `540b3b4`, which added structured runtime health summaries, persisted operator-action history, and bootstrap-exposed diagnostics/control services | Structured logs, metrics, health summaries, quarantine/operator action history, and clear runtime diagnostics |
-| **11** | **Create promotion gates from simulation to paper and paper to live** | A trading engine becomes dangerous when modes exist without disciplined acceptance criteria | Checklists, automated validation gates, drill scenarios, and mode-promotion tests/documentation |
+| **11** | **Create promotion gates from simulation to paper and paper to live** | Completed in commit `a6a73c6`, which added durable promotion-gate decision records, startup-enforced evidence checks for simulation-to-paper and paper-to-live transitions, and targeted persistence/startup regression coverage | Checklists, automated validation gates, drill scenarios, durable promotion decisions, and mode-promotion tests/documentation |
 | **12** | **Integrate a real broker adapter behind the existing boundary** | Only after durable coordination, reconciliation cadence, recovery, observability, and promotion discipline are in place should external capital-facing connectivity be attempted | Real adapter implementation, credential/config plumbing, sandbox/paper verification flows, and end-to-end tests |
 
 ## Definition of Done for the Next Several Steps
@@ -56,4 +56,4 @@ Each remaining step should continue to follow the same operating discipline used
 
 ## Immediate Next Target
 
-The next highest-value build target is **Step 11: create promotion gates from simulation to paper and paper to live**. Now that the engine has durable observability surfaces, persisted operator-action history, and structured runtime diagnostics, the next major gap is disciplined environment promotion. The system needs explicit acceptance criteria, operational drills, and automated guardrails so advancing from simulation to paper, and later from paper to live, is governed by evidence rather than optimism.
+The next highest-value build target is **Step 12: integrate a real broker adapter behind the existing boundary**. With durable coordination, reconciliation journals, risk controls, observability surfaces, and now promotion-gate discipline in place, the largest remaining production gap is external broker connectivity. The next milestone should wire a real broker implementation through the existing adapter boundary, preserve the project’s fail-closed startup posture, and verify sandbox or paper-trading flows before any live-capital path is considered.
