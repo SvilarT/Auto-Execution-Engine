@@ -24,7 +24,7 @@ The remaining work should be executed in the following order. Each step is inten
 
 | Priority | Step | Why it comes next | Expected output |
 |---|---|---|---|
-| **10** | **Add observability and operator control surfaces** | Safe runtime operation requires explainability under failure, not just correct code paths | Structured logs, metrics, health summaries, quarantine/operator action history, and clear runtime diagnostics |
+| **10** | **Add observability and operator control surfaces** | Completed in commit `540b3b4`, which added structured runtime health summaries, persisted operator-action history, and bootstrap-exposed diagnostics/control services | Structured logs, metrics, health summaries, quarantine/operator action history, and clear runtime diagnostics |
 | **11** | **Create promotion gates from simulation to paper and paper to live** | A trading engine becomes dangerous when modes exist without disciplined acceptance criteria | Checklists, automated validation gates, drill scenarios, and mode-promotion tests/documentation |
 | **12** | **Integrate a real broker adapter behind the existing boundary** | Only after durable coordination, reconciliation cadence, recovery, observability, and promotion discipline are in place should external capital-facing connectivity be attempted | Real adapter implementation, credential/config plumbing, sandbox/paper verification flows, and end-to-end tests |
 
@@ -56,4 +56,4 @@ Each remaining step should continue to follow the same operating discipline used
 
 ## Immediate Next Target
 
-The next highest-value build target is **Step 10: add observability and operator control surfaces**. Now that the engine has versioned exposure-aware risk controls on top of durable order, fill, position, and cash reconstruction, the next major gap is runtime visibility and operator ergonomics. Structured diagnostics, health summaries, and operator action history are the missing layer between correct fail-closed behavior and a system that can actually be supervised safely in paper and live-adjacent environments.
+The next highest-value build target is **Step 11: create promotion gates from simulation to paper and paper to live**. Now that the engine has durable observability surfaces, persisted operator-action history, and structured runtime diagnostics, the next major gap is disciplined environment promotion. The system needs explicit acceptance criteria, operational drills, and automated guardrails so advancing from simulation to paper, and later from paper to live, is governed by evidence rather than optimism.
