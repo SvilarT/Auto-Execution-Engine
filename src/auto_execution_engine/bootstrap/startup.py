@@ -1,4 +1,5 @@
 import os
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +15,14 @@ from auto_execution_engine.config.execution_mode import (
     ExecutionMode,
     ModeRuntimeProfile,
     SafetyGateConfig,
+    get_runtime_profile,
     validate_startup,
+)
+from auto_execution_engine.promotion_gates import (
+    PromotionGateDecisionRecord,
+    PromotionGateEvaluator,
+    PromotionGateInputs,
+    promotion_source_mode,
 )
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
@@ -46,6 +54,7 @@ class StartupContext:
     profile: ModeRuntimeProfile
     safety: SafetyGateConfig
     durable_state_root: Path
+    promotion_gate_decision: PromotionGateDecisionRecord | None = None
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -81,6 +90,17 @@ def resolve_order_store_path(*, context: StartupContext) -> Path:
         / context.profile.persistence_namespace
         / "orders.sqlite3"
     )
+
+
+def resolve_mode_order_store_path(
+    *, durable_state_root: Path, mode: ExecutionMode
+) -> Path:
+    profile = get_runtime_profile(mode)
+    return durable_state_root / profile.persistence_namespace / "orders.sqlite3"
+
+
+def resolve_promotion_store_path(*, durable_state_root: Path) -> Path:
+    return durable_state_root / "control" / "promotion.sqlite3"
 
 
 def build_order_store(*, context: StartupContext) -> SQLiteOrderStore:
@@ -243,6 +263,87 @@ def reconcile_all_startup_accounts(
     return [record.report for record in records if record.report is not None]
 
 
+def _read_csv_env(name: str) -> tuple[str, ...]:
+    raw_value = os.getenv(name, "")
+    if not raw_value.strip():
+        return ()
+    return tuple(
+        sorted(
+            {
+                item.strip()
+                for item in raw_value.split(",")
+                if item.strip()
+            }
+        )
+    )
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer value") from exc
+    if parsed < 1:
+        raise ConfigurationError(f"{name} must be greater than or equal to 1")
+    return parsed
+
+
+def _evaluate_promotion_gate(
+    *,
+    mode: ExecutionMode,
+    safety: SafetyGateConfig,
+    durable_state_root: Path,
+) -> PromotionGateDecisionRecord:
+    source_mode = promotion_source_mode(mode)
+    if source_mode is None:
+        raise ConfigurationError(
+            "promotion gates are only defined for paper and live startup"
+        )
+
+    evaluator = PromotionGateEvaluator()
+    evidence_store = SQLiteOrderStore(
+        db_path=resolve_mode_order_store_path(
+            durable_state_root=durable_state_root,
+            mode=source_mode,
+        )
+    )
+    evidence_store.initialize()
+    decision_store = SQLiteOrderStore(
+        db_path=resolve_promotion_store_path(durable_state_root=durable_state_root)
+    )
+    decision_store.initialize()
+    decision = evaluator.evaluate(
+        target_mode=mode,
+        source_mode=source_mode,
+        evidence_store=evidence_store,
+        decision_store=decision_store,
+        inputs=PromotionGateInputs(
+            safety=safety,
+            required_drills=_read_csv_env("AEE_REQUIRED_PROMOTION_DRILLS"),
+            completed_drills=_read_csv_env("AEE_COMPLETED_PROMOTION_DRILLS"),
+            min_healthy_accounts=_read_int_env(
+                "AEE_PROMOTION_MIN_HEALTHY_ACCOUNTS",
+                default=1,
+            ),
+        ),
+    )
+    evaluator.persist(decision_store=decision_store, record=decision)
+    if not decision.approved:
+        failed_detail = next(
+            (
+                criterion.detail
+                for criterion in decision.criteria
+                if not criterion.passed
+            ),
+            decision.summary,
+        )
+        raise ConfigurationError(failed_detail)
+    return decision
+
+
 def load_startup_context() -> StartupContext:
     mode = _read_mode_env()
 
@@ -256,10 +357,21 @@ def load_startup_context() -> StartupContext:
         operator_approval_present=_read_bool_env("AEE_OPERATOR_APPROVAL_PRESENT"),
     )
 
-    profile = validate_startup(mode=mode, safety=safety)
     durable_state_root = _read_durable_state_root()
+    promotion_gate_decision: PromotionGateDecisionRecord | None = None
+    if mode is ExecutionMode.SIMULATION:
+        profile = validate_startup(mode=mode, safety=safety)
+    else:
+        promotion_gate_decision = _evaluate_promotion_gate(
+            mode=mode,
+            safety=safety,
+            durable_state_root=durable_state_root,
+        )
+        profile = get_runtime_profile(mode)
+
     return StartupContext(
         profile=profile,
         safety=safety,
         durable_state_root=durable_state_root,
+        promotion_gate_decision=promotion_gate_decision,
     )

@@ -14,6 +14,7 @@ from auto_execution_engine.adapters.broker.service import (
     DuplicateSubmissionError,
     RegisteredSubmission,
 )
+from auto_execution_engine.config.execution_mode import ExecutionMode
 from auto_execution_engine.domain.events.models import DomainEvent, EventType
 from auto_execution_engine.domain.orders.models import (
     OrderAggregate,
@@ -26,6 +27,10 @@ from auto_execution_engine.domain.risk.models import AccountExposureSnapshot
 from auto_execution_engine.observability_models import (
     OperatorActionRecord,
     RuntimeHealthSummary,
+)
+from auto_execution_engine.promotion_gates import (
+    PromotionCriterionResult,
+    PromotionGateDecisionRecord,
 )
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
@@ -1397,6 +1402,145 @@ class SQLiteObservabilityStore(_SQLiteStore):
         return [row["account_id"] for row in rows]
 
 
+class SQLitePromotionGateStore(_SQLiteStore):
+    def initialize(self) -> None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+
+    def _initialize_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promotion_gate_decisions (
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_mode TEXT NOT NULL,
+                source_mode TEXT,
+                approved INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                evaluator TEXT NOT NULL,
+                evaluated_at TEXT NOT NULL,
+                required_drills_json TEXT NOT NULL,
+                completed_drills_json TEXT NOT NULL,
+                criteria_json TEXT NOT NULL
+            )
+            """
+        )
+
+    def append_decision(self, *, record: PromotionGateDecisionRecord) -> None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO promotion_gate_decisions(
+                    target_mode,
+                    source_mode,
+                    approved,
+                    summary,
+                    evaluator,
+                    evaluated_at,
+                    required_drills_json,
+                    completed_drills_json,
+                    criteria_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.target_mode.value,
+                    record.source_mode.value if record.source_mode is not None else None,
+                    int(record.approved),
+                    record.summary,
+                    record.evaluator,
+                    record.evaluated_at.isoformat(),
+                    json.dumps(list(record.required_drills)),
+                    json.dumps(list(record.completed_drills)),
+                    json.dumps(
+                        [
+                            {
+                                "criterion_name": criterion.criterion_name,
+                                "passed": criterion.passed,
+                                "detail": criterion.detail,
+                            }
+                            for criterion in record.criteria
+                        ]
+                    ),
+                ),
+            )
+
+    def load_latest_decision(
+        self, *, target_mode: str
+    ) -> PromotionGateDecisionRecord | None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            row = connection.execute(
+                """
+                SELECT target_mode, source_mode, approved, summary, evaluator, evaluated_at,
+                       required_drills_json, completed_drills_json, criteria_json
+                FROM promotion_gate_decisions
+                WHERE target_mode = ?
+                ORDER BY sequence_number DESC
+                LIMIT 1
+                """,
+                (target_mode,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._decision_from_row(row)
+
+    def list_decisions(
+        self, *, target_mode: str | None = None, limit: int = 50
+    ) -> list[PromotionGateDecisionRecord]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            if target_mode is None:
+                rows = connection.execute(
+                    """
+                    SELECT target_mode, source_mode, approved, summary, evaluator, evaluated_at,
+                           required_drills_json, completed_drills_json, criteria_json
+                    FROM promotion_gate_decisions
+                    ORDER BY sequence_number DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT target_mode, source_mode, approved, summary, evaluator, evaluated_at,
+                           required_drills_json, completed_drills_json, criteria_json
+                    FROM promotion_gate_decisions
+                    WHERE target_mode = ?
+                    ORDER BY sequence_number DESC
+                    LIMIT ?
+                    """,
+                    (target_mode, limit),
+                ).fetchall()
+        return [self._decision_from_row(row) for row in rows]
+
+    def _decision_from_row(self, row: sqlite3.Row) -> PromotionGateDecisionRecord:
+        criteria_payload = json.loads(row["criteria_json"])
+        return PromotionGateDecisionRecord(
+            target_mode=ExecutionMode(row["target_mode"]),
+            source_mode=(
+                ExecutionMode(row["source_mode"])
+                if row["source_mode"] is not None
+                else None
+            ),
+            approved=bool(row["approved"]),
+            summary=row["summary"],
+            evaluator=row["evaluator"],
+            evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+            required_drills=tuple(json.loads(row["required_drills_json"])),
+            completed_drills=tuple(json.loads(row["completed_drills_json"])),
+            criteria=tuple(
+                PromotionCriterionResult(
+                    criterion_name=item["criterion_name"],
+                    passed=bool(item["passed"]),
+                    detail=item["detail"],
+                )
+                for item in criteria_payload
+            ),
+        )
+
+
 class SQLiteOrderStore:
     """Coordinates durable event recording, append-only journaling, and order replay."""
 
@@ -1408,6 +1552,7 @@ class SQLiteOrderStore:
         self._submission_book = SQLiteSubmissionBook(db_path=self.db_path)
         self._lease_backend = SQLiteAccountLeaseBackend(db_path=self.db_path)
         self._observability_store = SQLiteObservabilityStore(db_path=self.db_path)
+        self._promotion_gate_store = SQLitePromotionGateStore(db_path=self.db_path)
         self._rehydrator = OrderAggregateRehydrator()
         self._projection_service = EventLogProjectionService()
 
@@ -1418,6 +1563,7 @@ class SQLiteOrderStore:
         self._submission_book.initialize()
         self._lease_backend.initialize()
         self._observability_store.initialize()
+        self._promotion_gate_store.initialize()
 
     def record_events(self, *, events: Iterable[DomainEvent]) -> None:
         events = list(events)
@@ -1631,6 +1777,25 @@ class SQLiteOrderStore:
 
     def list_accounts_with_runtime_health(self) -> list[str]:
         return self._observability_store.list_accounts_with_runtime_health()
+
+    def record_promotion_decision(self, *, record: PromotionGateDecisionRecord) -> None:
+        self._promotion_gate_store.append_decision(record=record)
+
+    def load_latest_promotion_decision(
+        self, *, target_mode: ExecutionMode
+    ) -> PromotionGateDecisionRecord | None:
+        return self._promotion_gate_store.load_latest_decision(target_mode=target_mode.value)
+
+    def list_promotion_decisions(
+        self,
+        *,
+        target_mode: ExecutionMode | None = None,
+        limit: int = 50,
+    ) -> list[PromotionGateDecisionRecord]:
+        return self._promotion_gate_store.list_decisions(
+            target_mode=target_mode.value if target_mode is not None else None,
+            limit=limit,
+        )
 
     def _load_latest_order_in_connection(
         self,

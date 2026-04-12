@@ -32,6 +32,11 @@ from auto_execution_engine.observability_models import (
     OperatorActionRecord,
     RuntimeHealthSummary,
 )
+from auto_execution_engine.config.execution_mode import ExecutionMode
+from auto_execution_engine.promotion_gates import (
+    PromotionCriterionResult,
+    PromotionGateDecisionRecord,
+)
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
     CashSnapshot,
@@ -743,3 +748,36 @@ def test_order_store_persists_runtime_health_summaries_across_restart(db_path: P
     assert restarted_store.load_latest_runtime_health_summary(account_id="acct-1") == summary
     assert restarted_store.list_runtime_health_summaries(account_id="acct-1") == [summary]
     assert restarted_store.list_accounts_with_runtime_health() == ["acct-1"]
+
+
+def test_order_store_persists_promotion_gate_decisions_across_restart(db_path: Path) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+    record = PromotionGateDecisionRecord(
+        target_mode=ExecutionMode.LIVE,
+        source_mode=ExecutionMode.PAPER,
+        approved=True,
+        summary="paper-to-live promotion approved",
+        evaluator="promotion_gate_evaluator_v1",
+        evaluated_at=datetime(2026, 1, 6, tzinfo=UTC),
+        required_drills=("kill_switch", "reconciliation"),
+        completed_drills=("kill_switch", "reconciliation"),
+        criteria=(
+            PromotionCriterionResult(
+                criterion_name="startup_safety",
+                passed=True,
+                detail="live startup safety gates satisfied",
+            ),
+            PromotionCriterionResult(
+                criterion_name="reconciliation",
+                passed=True,
+                detail="paper reconciliation completed without drift",
+            ),
+        ),
+    )
+
+    store.record_promotion_decision(record=record)
+
+    restarted_store = SQLiteOrderStore(db_path=db_path)
+    assert restarted_store.load_latest_promotion_decision(target_mode=ExecutionMode.LIVE) == record
+    assert restarted_store.list_promotion_decisions(target_mode=ExecutionMode.LIVE) == [record]

@@ -9,7 +9,9 @@ from auto_execution_engine.bootstrap.startup import (
     load_startup_context,
     reconcile_account_startup_state,
     reconcile_all_startup_accounts,
+    resolve_mode_order_store_path,
     resolve_order_store_path,
+    resolve_promotion_store_path,
 )
 from datetime import UTC, datetime
 
@@ -20,6 +22,7 @@ from auto_execution_engine.adapters.broker.models import (
     BrokerOrderSide,
     BrokerOrderType,
 )
+from auto_execution_engine.adapters.persistence.sqlite_order_store import SQLiteOrderStore
 from auto_execution_engine.config.execution_mode import ConfigurationError, ExecutionMode
 from auto_execution_engine.domain.orders.models import (
     OrderAggregate,
@@ -27,12 +30,99 @@ from auto_execution_engine.domain.orders.models import (
     OrderStatus,
     OrderType,
 )
+from auto_execution_engine.observability_models import RuntimeHealthSummary
+from auto_execution_engine.promotion_gates import PromotionGateDecisionRecord
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
     DriftCategory,
     ReconciliationAction,
+    ReconciliationReport,
+    ReconciliationRunRecord,
     ReconciliationRunStatus,
 )
+
+
+def seed_promotion_evidence(
+    *,
+    durable_state_root: Path,
+    target_mode: ExecutionMode,
+    account_id: str = "acct-1",
+) -> SQLiteOrderStore:
+    source_mode = (
+        ExecutionMode.SIMULATION
+        if target_mode is ExecutionMode.PAPER
+        else ExecutionMode.PAPER
+    )
+    source_store = SQLiteOrderStore(
+        db_path=resolve_mode_order_store_path(
+            durable_state_root=durable_state_root,
+            mode=source_mode,
+        )
+    )
+    source_store.initialize()
+    source_store.record_runtime_health_summary(
+        summary=RuntimeHealthSummary(
+            account_id=account_id,
+            generated_at=datetime(2026, 1, 6, tzinfo=UTC),
+            status="healthy",
+            active_order_count=0,
+            open_position_count=0,
+            gross_notional=0.0,
+            cash_balance=25_000.0,
+            is_quarantined=False,
+            kill_switch_active=False,
+            latest_reconciliation_action="no_action",
+            latest_reconciliation_status="completed",
+            latest_reconciliation_detail="promotion evidence healthy",
+            drift_count=0,
+            last_operator_action_type="resume_trading",
+            detail="healthy runtime state for promotion review",
+        )
+    )
+    if target_mode is ExecutionMode.LIVE:
+        report = ReconciliationReport(
+            account_id=account_id,
+            generated_at=datetime(2026, 1, 6, tzinfo=UTC),
+            action=ReconciliationAction.NO_ACTION,
+            drifts=(),
+        )
+        source_store.record_reconciliation_report(report=report)
+        source_store.record_reconciliation_run(
+            record=ReconciliationRunRecord(
+                run_id="promotion-run-1",
+                account_id=account_id,
+                owner_id="promotion-evaluator",
+                started_at=datetime(2026, 1, 6, 0, 0, 0, tzinfo=UTC),
+                completed_at=datetime(2026, 1, 6, 0, 0, 1, tzinfo=UTC),
+                status=ReconciliationRunStatus.COMPLETED,
+                detail="reconciliation completed without drift",
+                report=report,
+            )
+        )
+        decision_store = SQLiteOrderStore(
+            db_path=resolve_promotion_store_path(durable_state_root=durable_state_root)
+        )
+        decision_store.initialize()
+        decision_store.record_promotion_decision(
+            record=PromotionGateDecisionRecord(
+                target_mode=ExecutionMode.PAPER,
+                source_mode=ExecutionMode.SIMULATION,
+                approved=True,
+                summary="promotion from simulation to paper approved",
+                evaluator="promotion_gate_evaluator_v1",
+                evaluated_at=datetime(2026, 1, 5, tzinfo=UTC),
+                required_drills=(
+                    "simulation_stability",
+                    "order_lifecycle_recovery",
+                ),
+                completed_drills=(
+                    "simulation_stability",
+                    "order_lifecycle_recovery",
+                ),
+                criteria=(),
+            )
+        )
+    return source_store
 
 
 def test_simulation_mode_starts_with_defaults(monkeypatch) -> None:
@@ -75,7 +165,10 @@ def test_live_mode_requires_operator_approval(monkeypatch) -> None:
         assert "operator approval" in str(exc)
 
 
-def test_live_mode_starts_only_when_all_safety_gates_are_present(monkeypatch) -> None:
+def test_live_mode_starts_only_when_all_safety_gates_are_present(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.LIVE)
     monkeypatch.setenv("AEE_EXECUTION_MODE", "live")
     monkeypatch.setenv("AEE_ALLOW_LIVE", "true")
     monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
@@ -83,8 +176,15 @@ def test_live_mode_starts_only_when_all_safety_gates_are_present(monkeypatch) ->
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_OPERATOR_APPROVAL_PRESENT", "true")
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "paper_reconciliation,kill_switch_response,operator_override",
+    )
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
 
     context = load_startup_context()
+
+    assert context.promotion_gate_decision is not None
 
     assert context.profile.mode is ExecutionMode.LIVE
     assert context.profile.synthetic_data_allowed is False
@@ -99,6 +199,11 @@ def test_runtime_namespace_resolves_durable_store_path(monkeypatch, tmp_path: Pa
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
 
@@ -115,6 +220,11 @@ def test_build_order_store_initializes_namespace_backed_sqlite_file(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -133,6 +243,11 @@ def test_startup_builds_durable_submission_service_from_runtime_namespace(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     submission_service = build_submission_service(context=context)
@@ -166,6 +281,11 @@ def test_startup_builds_durable_account_lease_service_from_runtime_namespace(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     first_service = build_account_lease_service(context=context)
@@ -198,6 +318,11 @@ def test_startup_reconciliation_repairs_created_order_from_durable_submission(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -250,6 +375,11 @@ def test_startup_builds_reconciliation_runner_from_runtime_namespace(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -286,6 +416,11 @@ def test_startup_reconciliation_persists_full_cycle_inputs_and_outcomes(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -336,6 +471,11 @@ def test_startup_reconciliation_records_quarantine_from_persisted_internal_snaps
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -372,6 +512,11 @@ def test_startup_reconciliation_allows_clear_account_when_snapshots_match(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -420,6 +565,11 @@ def test_build_account_quarantine_registry_can_preload_latest_persisted_reports(
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -494,6 +644,11 @@ def test_reconcile_all_startup_accounts_sweeps_active_and_previously_reported_ac
     monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
     monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
 
     context = load_startup_context()
     store = build_order_store(context=context)
@@ -557,3 +712,61 @@ def test_reconcile_all_startup_accounts_sweeps_active_and_previously_reported_ac
     assert [report.account_id for report in reports] == ["acct-active", "acct-reported"]
     assert registry.is_quarantined(account_id="acct-active") is True
     assert registry.is_quarantined(account_id="acct-reported") is True
+
+
+def test_paper_mode_requires_promotion_gate_health_evidence(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "paper")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+
+    with pytest.raises(ConfigurationError, match="expected at least 1 healthy account summaries"):
+        load_startup_context()
+
+    decision_store = SQLiteOrderStore(
+        db_path=resolve_promotion_store_path(durable_state_root=tmp_path)
+    )
+    decision_store.initialize()
+    latest_decision = decision_store.load_latest_promotion_decision(
+        target_mode=ExecutionMode.PAPER
+    )
+
+    assert latest_decision is not None
+    assert latest_decision.approved is False
+
+
+def test_live_mode_persists_approved_promotion_gate_decision(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.LIVE)
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "live")
+    monkeypatch.setenv("AEE_ALLOW_LIVE", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv("AEE_OPERATOR_APPROVAL_PRESENT", "true")
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "paper_reconciliation,kill_switch_response,operator_override",
+    )
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+
+    context = load_startup_context()
+    decision_store = SQLiteOrderStore(
+        db_path=resolve_promotion_store_path(durable_state_root=tmp_path)
+    )
+    persisted_decision = decision_store.load_latest_promotion_decision(
+        target_mode=ExecutionMode.LIVE
+    )
+
+    assert isinstance(context.promotion_gate_decision, PromotionGateDecisionRecord)
+    assert persisted_decision == context.promotion_gate_decision
+    assert persisted_decision is not None
+    assert persisted_decision.approved is True
+    assert persisted_decision.source_mode is ExecutionMode.PAPER
