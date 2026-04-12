@@ -20,10 +20,13 @@ from auto_execution_engine.domain.orders.models import OrderAggregate, OrderFill
 from auto_execution_engine.domain.risk.models import (
     AccountExposureSnapshot,
     KillSwitch,
+    KillSwitchState,
     OrderIntent,
     RiskDecision,
 )
 from auto_execution_engine.domain.risk.service import RiskService
+from auto_execution_engine.observability_models import OperatorActionRecord, RuntimeHealthSummary
+from auto_execution_engine.observability_service import AccountRuntimeSnapshot, RuntimeHealthService
 from auto_execution_engine.reconciliation.models import CashSnapshot, PositionSnapshot
 from auto_execution_engine.reconciliation.service import ReconciliationQuarantineError
 from auto_execution_engine.trading_plane.leases import AccountLease, AccountLeaseService, LeaseError
@@ -43,6 +46,8 @@ class DurableOrderStore(Protocol):
         fill: OrderFill,
     ) -> tuple[OrderAggregate, DomainEvent]: ...
 
+    def list_internal_order_snapshots(self, *, account_id: str | None = None) -> list: ...
+
     def project_internal_positions(self, *, account_id: str) -> list[PositionSnapshot]: ...
 
     def project_internal_cash(
@@ -53,6 +58,26 @@ class DurableOrderStore(Protocol):
     ) -> CashSnapshot: ...
 
     def project_internal_exposure(self, *, account_id: str) -> AccountExposureSnapshot: ...
+
+    def load_latest_reconciliation_report(self, *, account_id: str): ...
+
+    def load_latest_reconciliation_run(self, *, account_id: str): ...
+
+    def record_operator_action(self, *, record: OperatorActionRecord) -> None: ...
+
+    def list_operator_actions(self, *, account_id: str, limit: int = 50) -> list[OperatorActionRecord]: ...
+
+    def record_runtime_health_summary(self, *, summary: RuntimeHealthSummary) -> None: ...
+
+    def load_latest_runtime_health_summary(
+        self, *, account_id: str
+    ) -> RuntimeHealthSummary | None: ...
+
+    def list_runtime_health_summaries(
+        self, *, account_id: str, limit: int = 50
+    ) -> list[RuntimeHealthSummary]: ...
+
+    def list_accounts_with_runtime_health(self) -> list[str]: ...
 
 
 class AccountExecutionGate(Protocol):
@@ -375,3 +400,184 @@ class ExecutionApplicationService:
 
         self._order_store.record_events(events=[order.create_event()])
         return order
+
+
+class OperatorControlService:
+    def __init__(self, *, order_store: DurableOrderStore) -> None:
+        self._order_store = order_store
+
+    def activate_kill_switch(
+        self,
+        *,
+        account_id: str,
+        reason: str,
+        operator_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> KillSwitch:
+        kill_switch = KillSwitch(
+            account_id=account_id,
+            state=KillSwitchState.ACTIVE,
+            activated_reason=reason,
+            updated_at=datetime.now(UTC),
+        )
+        record = OperatorActionRecord(
+            account_id=account_id,
+            action_type="kill_switch_activated",
+            detail=reason,
+            operator_id=operator_id,
+            correlation_id=correlation_id,
+            recorded_at=kill_switch.updated_at,
+        )
+        event = DomainEvent(
+            event_type=EventType.KILL_SWITCH_ACTIVATED,
+            aggregate_id=account_id,
+            account_id=account_id,
+            occurred_at=kill_switch.updated_at,
+            correlation_id=correlation_id,
+            payload={
+                "account_id": account_id,
+                "action_type": record.action_type,
+                "detail": reason,
+                "operator_id": operator_id,
+                "kill_switch_state": kill_switch.state.value,
+            },
+        )
+        self._order_store.record_events(events=[event])
+        self._order_store.record_operator_action(record=record)
+        return kill_switch
+
+    def release_kill_switch(
+        self,
+        *,
+        account_id: str,
+        detail: str,
+        operator_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> KillSwitch:
+        released_at = datetime.now(UTC)
+        kill_switch = KillSwitch(
+            account_id=account_id,
+            state=KillSwitchState.INACTIVE,
+            activated_reason=None,
+            updated_at=released_at,
+        )
+        record = OperatorActionRecord(
+            account_id=account_id,
+            action_type="kill_switch_released",
+            detail=detail,
+            operator_id=operator_id,
+            correlation_id=correlation_id,
+            recorded_at=released_at,
+        )
+        event = DomainEvent(
+            event_type=EventType.OPERATOR_OVERRIDE_RECORDED,
+            aggregate_id=account_id,
+            account_id=account_id,
+            occurred_at=released_at,
+            correlation_id=correlation_id,
+            payload={
+                "account_id": account_id,
+                "action_type": record.action_type,
+                "detail": detail,
+                "operator_id": operator_id,
+                "kill_switch_state": kill_switch.state.value,
+            },
+        )
+        self._order_store.record_events(events=[event])
+        self._order_store.record_operator_action(record=record)
+        return kill_switch
+
+    def record_override(
+        self,
+        *,
+        account_id: str,
+        detail: str,
+        operator_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> OperatorActionRecord:
+        recorded_at = datetime.now(UTC)
+        record = OperatorActionRecord(
+            account_id=account_id,
+            action_type="operator_override_recorded",
+            detail=detail,
+            operator_id=operator_id,
+            correlation_id=correlation_id,
+            recorded_at=recorded_at,
+        )
+        event = DomainEvent(
+            event_type=EventType.OPERATOR_OVERRIDE_RECORDED,
+            aggregate_id=account_id,
+            account_id=account_id,
+            occurred_at=recorded_at,
+            correlation_id=correlation_id,
+            payload={
+                "account_id": account_id,
+                "action_type": record.action_type,
+                "detail": detail,
+                "operator_id": operator_id,
+            },
+        )
+        self._order_store.record_events(events=[event])
+        self._order_store.record_operator_action(record=record)
+        return record
+
+    def list_history(self, *, account_id: str, limit: int = 50) -> list[OperatorActionRecord]:
+        return self._order_store.list_operator_actions(account_id=account_id, limit=limit)
+
+
+class RuntimeDiagnosticsService:
+    def __init__(
+        self,
+        *,
+        order_store: DurableOrderStore,
+        runtime_health_service: RuntimeHealthService | None = None,
+    ) -> None:
+        self._order_store = order_store
+        self._runtime_health_service = runtime_health_service or RuntimeHealthService()
+
+    def capture_account_health(
+        self,
+        *,
+        account_id: str,
+        kill_switch: KillSwitch,
+        is_quarantined: bool = False,
+        opening_balance: float = 0.0,
+    ) -> RuntimeHealthSummary:
+        internal_orders = self._order_store.list_internal_order_snapshots(account_id=account_id)
+        positions = self._order_store.project_internal_positions(account_id=account_id)
+        cash = self._order_store.project_internal_cash(
+            account_id=account_id,
+            opening_balance=opening_balance,
+        )
+        exposure = self._order_store.project_internal_exposure(account_id=account_id)
+        latest_report = self._order_store.load_latest_reconciliation_report(account_id=account_id)
+        latest_run = self._order_store.load_latest_reconciliation_run(account_id=account_id)
+        operator_actions = self._order_store.list_operator_actions(account_id=account_id, limit=1)
+        summary = self._runtime_health_service.summarize(
+            snapshot=AccountRuntimeSnapshot(
+                account_id=account_id,
+                active_order_count=len(
+                    [
+                        order
+                        for order in internal_orders
+                        if order.status not in {OrderStatus.FILLED.value, OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value}
+                    ]
+                ),
+                open_position_count=len([position for position in positions if position.quantity != 0]),
+                gross_notional=exposure.gross_notional,
+                cash_balance=cash.balance,
+                is_quarantined=is_quarantined,
+                kill_switch=kill_switch,
+                latest_reconciliation_report=latest_report,
+                latest_reconciliation_run=latest_run,
+                latest_operator_action=operator_actions[0] if operator_actions else None,
+            )
+        )
+        self._order_store.record_runtime_health_summary(summary=summary)
+        return summary
+
+    def list_history(self, *, account_id: str, limit: int = 50) -> list[RuntimeHealthSummary]:
+        return self._order_store.list_runtime_health_summaries(account_id=account_id, limit=limit)
+
+    def load_latest(self, *, account_id: str) -> RuntimeHealthSummary | None:
+        return self._order_store.load_latest_runtime_health_summary(account_id=account_id)

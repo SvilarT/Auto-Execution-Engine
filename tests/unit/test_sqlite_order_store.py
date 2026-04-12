@@ -28,6 +28,10 @@ from auto_execution_engine.domain.orders.models import (
     OrderStatus,
     OrderType,
 )
+from auto_execution_engine.observability_models import (
+    OperatorActionRecord,
+    RuntimeHealthSummary,
+)
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
     CashSnapshot,
@@ -690,3 +694,52 @@ def test_account_lease_backend_release_rejects_wrong_owner(db_path: Path) -> Non
             owner_id="worker-b",
             now=now.replace(second=5),
         )
+
+
+def test_order_store_persists_operator_action_history_across_restart(db_path: Path) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+    recorded_at = datetime(2026, 1, 4, tzinfo=UTC)
+    record = OperatorActionRecord(
+        account_id="acct-1",
+        action_type="kill_switch_activated",
+        detail="manual halt after drift review",
+        operator_id="op-7",
+        correlation_id="corr-1",
+        recorded_at=recorded_at,
+    )
+
+    store.record_operator_action(record=record)
+
+    restarted_store = SQLiteOrderStore(db_path=db_path)
+    assert restarted_store.list_operator_actions(account_id="acct-1") == [record]
+
+
+def test_order_store_persists_runtime_health_summaries_across_restart(db_path: Path) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+    generated_at = datetime(2026, 1, 5, tzinfo=UTC)
+    summary = RuntimeHealthSummary(
+        account_id="acct-1",
+        generated_at=generated_at,
+        status="quarantined",
+        active_order_count=2,
+        open_position_count=1,
+        gross_notional=42_500.0,
+        cash_balance=12_000.0,
+        is_quarantined=True,
+        kill_switch_active=False,
+        latest_reconciliation_action="quarantine_account",
+        latest_reconciliation_status="completed",
+        latest_reconciliation_detail="broker drift exceeded threshold",
+        drift_count=2,
+        last_operator_action_type="operator_override_recorded",
+        detail="quarantine active; broker drift exceeded threshold",
+    )
+
+    store.record_runtime_health_summary(summary=summary)
+
+    restarted_store = SQLiteOrderStore(db_path=db_path)
+    assert restarted_store.load_latest_runtime_health_summary(account_id="acct-1") == summary
+    assert restarted_store.list_runtime_health_summaries(account_id="acct-1") == [summary]
+    assert restarted_store.list_accounts_with_runtime_health() == ["acct-1"]

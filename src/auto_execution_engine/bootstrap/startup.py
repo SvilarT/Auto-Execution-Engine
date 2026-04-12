@@ -4,6 +4,10 @@ from pathlib import Path
 
 from auto_execution_engine.adapters.broker.service import BrokerSubmissionService
 from auto_execution_engine.adapters.persistence.sqlite_order_store import SQLiteOrderStore
+from auto_execution_engine.application.execution_service import (
+    OperatorControlService,
+    RuntimeDiagnosticsService,
+)
 from auto_execution_engine.trading_plane.leases import AccountLeaseService
 from auto_execution_engine.config.execution_mode import (
     ConfigurationError,
@@ -93,6 +97,24 @@ def build_submission_service(*, context: StartupContext) -> BrokerSubmissionServ
 def build_account_lease_service(*, context: StartupContext) -> AccountLeaseService:
     store = build_order_store(context=context)
     return AccountLeaseService(backend=store.build_account_lease_backend())
+
+
+def build_operator_control_service(
+    *,
+    context: StartupContext,
+    order_store: SQLiteOrderStore | None = None,
+) -> OperatorControlService:
+    store = order_store or build_order_store(context=context)
+    return OperatorControlService(order_store=store)
+
+
+def build_runtime_diagnostics_service(
+    *,
+    context: StartupContext,
+    order_store: SQLiteOrderStore | None = None,
+) -> RuntimeDiagnosticsService:
+    store = order_store or build_order_store(context=context)
+    return RuntimeDiagnosticsService(order_store=store)
 
 
 def build_reconciliation_runner(

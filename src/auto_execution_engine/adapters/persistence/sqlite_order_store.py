@@ -23,6 +23,10 @@ from auto_execution_engine.domain.orders.models import (
     OrderType,
 )
 from auto_execution_engine.domain.risk.models import AccountExposureSnapshot
+from auto_execution_engine.observability_models import (
+    OperatorActionRecord,
+    RuntimeHealthSummary,
+)
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
     CashSnapshot,
@@ -1182,6 +1186,217 @@ class SQLiteAccountLeaseBackend(_SQLiteStore):
             )
 
 
+class SQLiteObservabilityStore(_SQLiteStore):
+    def initialize(self) -> None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+
+    def _initialize_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_action_history (
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                operator_id TEXT,
+                correlation_id TEXT,
+                recorded_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_health_summaries (
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                generated_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                active_order_count INTEGER NOT NULL,
+                open_position_count INTEGER NOT NULL,
+                gross_notional REAL NOT NULL,
+                cash_balance REAL NOT NULL,
+                is_quarantined INTEGER NOT NULL,
+                kill_switch_active INTEGER NOT NULL,
+                latest_reconciliation_action TEXT,
+                latest_reconciliation_status TEXT,
+                latest_reconciliation_detail TEXT,
+                drift_count INTEGER NOT NULL,
+                last_operator_action_type TEXT,
+                detail TEXT NOT NULL
+            )
+            """
+        )
+
+    def append_operator_action(self, *, record: OperatorActionRecord) -> None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO operator_action_history(
+                    account_id, action_type, detail, operator_id, correlation_id, recorded_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.account_id,
+                    record.action_type,
+                    record.detail,
+                    record.operator_id,
+                    record.correlation_id,
+                    record.recorded_at.isoformat(),
+                ),
+            )
+
+    def list_operator_actions(
+        self, *, account_id: str, limit: int = 50
+    ) -> list[OperatorActionRecord]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT account_id, action_type, detail, operator_id, correlation_id, recorded_at
+                FROM operator_action_history
+                WHERE account_id = ?
+                ORDER BY sequence_number DESC
+                LIMIT ?
+                """,
+                (account_id, limit),
+            ).fetchall()
+        return [
+            OperatorActionRecord(
+                account_id=row["account_id"],
+                action_type=row["action_type"],
+                detail=row["detail"],
+                operator_id=row["operator_id"],
+                correlation_id=row["correlation_id"],
+                recorded_at=datetime.fromisoformat(row["recorded_at"]),
+            )
+            for row in rows
+        ]
+
+    def append_runtime_health_summary(self, *, summary: RuntimeHealthSummary) -> None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO runtime_health_summaries(
+                    account_id, generated_at, status, active_order_count, open_position_count,
+                    gross_notional, cash_balance, is_quarantined, kill_switch_active,
+                    latest_reconciliation_action, latest_reconciliation_status,
+                    latest_reconciliation_detail, drift_count, last_operator_action_type, detail
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    summary.account_id,
+                    summary.generated_at.isoformat(),
+                    summary.status,
+                    summary.active_order_count,
+                    summary.open_position_count,
+                    summary.gross_notional,
+                    summary.cash_balance,
+                    int(summary.is_quarantined),
+                    int(summary.kill_switch_active),
+                    summary.latest_reconciliation_action,
+                    summary.latest_reconciliation_status,
+                    summary.latest_reconciliation_detail,
+                    summary.drift_count,
+                    summary.last_operator_action_type,
+                    summary.detail,
+                ),
+            )
+
+    def load_latest_runtime_health_summary(
+        self, *, account_id: str
+    ) -> RuntimeHealthSummary | None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            row = connection.execute(
+                """
+                SELECT account_id, generated_at, status, active_order_count, open_position_count,
+                       gross_notional, cash_balance, is_quarantined, kill_switch_active,
+                       latest_reconciliation_action, latest_reconciliation_status,
+                       latest_reconciliation_detail, drift_count, last_operator_action_type, detail
+                FROM runtime_health_summaries
+                WHERE account_id = ?
+                ORDER BY sequence_number DESC
+                LIMIT 1
+                """,
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RuntimeHealthSummary(
+            account_id=row["account_id"],
+            generated_at=datetime.fromisoformat(row["generated_at"]),
+            status=row["status"],
+            active_order_count=row["active_order_count"],
+            open_position_count=row["open_position_count"],
+            gross_notional=row["gross_notional"],
+            cash_balance=row["cash_balance"],
+            is_quarantined=bool(row["is_quarantined"]),
+            kill_switch_active=bool(row["kill_switch_active"]),
+            latest_reconciliation_action=row["latest_reconciliation_action"],
+            latest_reconciliation_status=row["latest_reconciliation_status"],
+            latest_reconciliation_detail=row["latest_reconciliation_detail"],
+            drift_count=row["drift_count"],
+            last_operator_action_type=row["last_operator_action_type"],
+            detail=row["detail"],
+        )
+
+    def list_runtime_health_summaries(
+        self, *, account_id: str, limit: int = 50
+    ) -> list[RuntimeHealthSummary]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT account_id, generated_at, status, active_order_count, open_position_count,
+                       gross_notional, cash_balance, is_quarantined, kill_switch_active,
+                       latest_reconciliation_action, latest_reconciliation_status,
+                       latest_reconciliation_detail, drift_count, last_operator_action_type, detail
+                FROM runtime_health_summaries
+                WHERE account_id = ?
+                ORDER BY sequence_number DESC
+                LIMIT ?
+                """,
+                (account_id, limit),
+            ).fetchall()
+        return [
+            RuntimeHealthSummary(
+                account_id=row["account_id"],
+                generated_at=datetime.fromisoformat(row["generated_at"]),
+                status=row["status"],
+                active_order_count=row["active_order_count"],
+                open_position_count=row["open_position_count"],
+                gross_notional=row["gross_notional"],
+                cash_balance=row["cash_balance"],
+                is_quarantined=bool(row["is_quarantined"]),
+                kill_switch_active=bool(row["kill_switch_active"]),
+                latest_reconciliation_action=row["latest_reconciliation_action"],
+                latest_reconciliation_status=row["latest_reconciliation_status"],
+                latest_reconciliation_detail=row["latest_reconciliation_detail"],
+                drift_count=row["drift_count"],
+                last_operator_action_type=row["last_operator_action_type"],
+                detail=row["detail"],
+            )
+            for row in rows
+        ]
+
+    def list_accounts_with_runtime_health(self) -> list[str]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT DISTINCT account_id
+                FROM runtime_health_summaries
+                ORDER BY account_id ASC
+                """
+            ).fetchall()
+        return [row["account_id"] for row in rows]
+
+
 class SQLiteOrderStore:
     """Coordinates durable event recording, append-only journaling, and order replay."""
 
@@ -1192,6 +1407,7 @@ class SQLiteOrderStore:
         self._reconciliation_reports = SQLiteReconciliationReportStore(db_path=self.db_path)
         self._submission_book = SQLiteSubmissionBook(db_path=self.db_path)
         self._lease_backend = SQLiteAccountLeaseBackend(db_path=self.db_path)
+        self._observability_store = SQLiteObservabilityStore(db_path=self.db_path)
         self._rehydrator = OrderAggregateRehydrator()
         self._projection_service = EventLogProjectionService()
 
@@ -1201,6 +1417,7 @@ class SQLiteOrderStore:
         self._reconciliation_reports.initialize()
         self._submission_book.initialize()
         self._lease_backend.initialize()
+        self._observability_store.initialize()
 
     def record_events(self, *, events: Iterable[DomainEvent]) -> None:
         events = list(events)
@@ -1382,6 +1599,38 @@ class SQLiteOrderStore:
 
     def list_accounts_requiring_reconciliation(self) -> list[str]:
         return self._order_journal.list_active_account_ids()
+
+    def record_operator_action(self, *, record: OperatorActionRecord) -> None:
+        self._observability_store.append_operator_action(record=record)
+
+    def list_operator_actions(
+        self, *, account_id: str, limit: int = 50
+    ) -> list[OperatorActionRecord]:
+        return self._observability_store.list_operator_actions(
+            account_id=account_id,
+            limit=limit,
+        )
+
+    def record_runtime_health_summary(self, *, summary: RuntimeHealthSummary) -> None:
+        self._observability_store.append_runtime_health_summary(summary=summary)
+
+    def load_latest_runtime_health_summary(
+        self, *, account_id: str
+    ) -> RuntimeHealthSummary | None:
+        return self._observability_store.load_latest_runtime_health_summary(
+            account_id=account_id
+        )
+
+    def list_runtime_health_summaries(
+        self, *, account_id: str, limit: int = 50
+    ) -> list[RuntimeHealthSummary]:
+        return self._observability_store.list_runtime_health_summaries(
+            account_id=account_id,
+            limit=limit,
+        )
+
+    def list_accounts_with_runtime_health(self) -> list[str]:
+        return self._observability_store.list_accounts_with_runtime_health()
 
     def _load_latest_order_in_connection(
         self,

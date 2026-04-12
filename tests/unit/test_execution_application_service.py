@@ -21,6 +21,8 @@ from auto_execution_engine.adapters.persistence.sqlite_order_store import (
 from auto_execution_engine.application.execution_service import (
     ExecutionApplicationService,
     ExecutionRejectedError,
+    OperatorControlService,
+    RuntimeDiagnosticsService,
 )
 from auto_execution_engine.domain.orders.models import OrderAggregate, OrderSide, OrderStatus, OrderType
 from auto_execution_engine.domain.risk.models import KillSwitch, KillSwitchState
@@ -668,3 +670,56 @@ def test_execution_service_persists_risk_rejection_event_with_policy_metadata(
         risk_rejected_event.payload["reason_code"]
         == "account_gross_notional_limit_exceeded"
     )
+
+
+def test_operator_control_service_records_kill_switch_action_and_event(db_path: Path) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    service = OperatorControlService(order_store=order_store)
+
+    kill_switch = service.activate_kill_switch(
+        account_id="acct-1",
+        reason="manual halt after venue incident",
+        operator_id="op-1",
+        correlation_id="corr-10",
+    )
+
+    assert kill_switch.state is KillSwitchState.ACTIVE
+    history = service.list_history(account_id="acct-1")
+    assert len(history) == 1
+    assert history[0].action_type == "kill_switch_activated"
+    assert history[0].operator_id == "op-1"
+
+    persisted_events = order_store.list_events(aggregate_id="acct-1")
+    assert persisted_events[-1].event_type.value == "kill_switch_activated"
+    assert persisted_events[-1].payload["detail"] == "manual halt after venue incident"
+
+
+def test_runtime_diagnostics_service_captures_and_persists_account_health(db_path: Path) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    operator_service = OperatorControlService(order_store=order_store)
+    diagnostics = RuntimeDiagnosticsService(order_store=order_store)
+
+    operator_service.record_override(
+        account_id="acct-1",
+        detail="operator acknowledged venue instability",
+        operator_id="op-2",
+        correlation_id="corr-11",
+    )
+
+    summary = diagnostics.capture_account_health(
+        account_id="acct-1",
+        kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.ACTIVE),
+        is_quarantined=False,
+        opening_balance=25_000.0,
+    )
+
+    assert summary.account_id == "acct-1"
+    assert summary.status == "kill_switch_active"
+    assert summary.kill_switch_active is True
+    assert summary.last_operator_action_type == "operator_override_recorded"
+
+    latest = diagnostics.load_latest(account_id="acct-1")
+    assert latest == summary
+    assert diagnostics.list_history(account_id="acct-1") == [summary]
