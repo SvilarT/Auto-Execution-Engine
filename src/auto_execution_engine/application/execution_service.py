@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from auto_execution_engine.adapters.broker.models import (
@@ -13,7 +14,7 @@ from auto_execution_engine.adapters.broker.service import (
     UnknownBrokerSubmissionError,
 )
 from auto_execution_engine.domain.events.models import DomainEvent
-from auto_execution_engine.domain.orders.models import OrderAggregate, OrderStatus
+from auto_execution_engine.domain.orders.models import OrderAggregate, OrderFill, OrderStatus
 from auto_execution_engine.domain.risk.models import KillSwitch, OrderIntent, RiskDecision
 from auto_execution_engine.domain.risk.service import RiskService
 from auto_execution_engine.reconciliation.service import ReconciliationQuarantineError
@@ -26,6 +27,13 @@ class DurableOrderStore(Protocol):
     def load_latest_order(self, *, client_order_id: str) -> OrderAggregate | None: ...
 
     def load_order(self, *, client_order_id: str) -> OrderAggregate: ...
+
+    def ingest_fill(
+        self,
+        *,
+        client_order_id: str,
+        fill: OrderFill,
+    ) -> tuple[OrderAggregate, DomainEvent]: ...
 
 
 class AccountExecutionGate(Protocol):
@@ -42,6 +50,12 @@ class ExecutionResult:
     events: list[DomainEvent]
     broker_order_id: str
     lease: AccountLease
+
+
+@dataclass(frozen=True)
+class FillIngestionResult:
+    order: OrderAggregate
+    event: DomainEvent
 
 
 class ExecutionApplicationService:
@@ -178,6 +192,37 @@ class ExecutionApplicationService:
         if self._order_store is None:
             raise ExecutionRejectedError("durable order store is not configured")
         return self._order_store.load_order(client_order_id=client_order_id)
+
+    def ingest_fill(
+        self,
+        *,
+        client_order_id: str,
+        fill_id: str,
+        fill_quantity: float,
+        fill_price: float,
+        occurred_at: datetime,
+        broker_order_id: str | None = None,
+        source: str = "broker",
+    ) -> FillIngestionResult:
+        if self._order_store is None:
+            raise ExecutionRejectedError("durable order store is not configured")
+
+        try:
+            order, event = self._order_store.ingest_fill(
+                client_order_id=client_order_id,
+                fill=OrderFill(
+                    fill_id=fill_id,
+                    quantity=fill_quantity,
+                    price=fill_price,
+                    occurred_at=occurred_at,
+                    broker_order_id=broker_order_id,
+                    source=source,
+                ),
+            )
+        except ValueError as exc:
+            raise ExecutionRejectedError(str(exc)) from exc
+
+        return FillIngestionResult(order=order, event=event)
 
     def _acquire_execution_lease(
         self,

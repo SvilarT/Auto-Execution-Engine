@@ -17,6 +17,7 @@ from auto_execution_engine.adapters.broker.service import (
 from auto_execution_engine.domain.events.models import DomainEvent, EventType
 from auto_execution_engine.domain.orders.models import (
     OrderAggregate,
+    OrderFill,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -1115,6 +1116,64 @@ class SQLiteOrderStore:
     def load_latest_order(self, *, client_order_id: str) -> OrderAggregate | None:
         return self._order_journal.load_latest(client_order_id=client_order_id)
 
+    def ingest_fill(
+        self,
+        *,
+        client_order_id: str,
+        fill: OrderFill,
+    ) -> tuple[OrderAggregate, DomainEvent]:
+        with self._event_store._connect() as connection:
+            self._event_store._initialize_schema(connection)
+            order = self._load_latest_order_in_connection(
+                connection=connection,
+                client_order_id=client_order_id,
+            )
+            if order is None:
+                raise PersistenceError(
+                    f"cannot ingest fill for unknown order {client_order_id}"
+                )
+
+            fill_event_id = order.fill_event_id(fill_id=fill.fill_id)
+            existing_event = self._load_domain_event_by_id_in_connection(
+                connection=connection,
+                event_id=fill_event_id,
+            )
+            if existing_event is not None:
+                payload = existing_event.payload
+                if (
+                    existing_event.aggregate_id != client_order_id
+                    or payload.get("fill_id") != fill.fill_id
+                    or abs(float(payload.get("last_fill_quantity", 0.0)) - fill.quantity) > 1e-9
+                    or abs(float(payload.get("last_fill_price", 0.0)) - fill.price) > 1e-9
+                    or payload.get("broker_order_id") != fill.broker_order_id
+                    or payload.get("fill_source") != fill.source
+                    or existing_event.occurred_at != fill.occurred_at
+                ):
+                    raise PersistenceError(
+                        "conflicting fill replay for order "
+                        f"{client_order_id} and fill {fill.fill_id}"
+                    )
+                latest_order = self._load_latest_order_in_connection(
+                    connection=connection,
+                    client_order_id=client_order_id,
+                )
+                if latest_order is None:
+                    raise PersistenceError(
+                        f"order {client_order_id} disappeared during fill replay"
+                    )
+                return latest_order, existing_event
+
+            updated_order, fill_event = order.apply_fill(fill=fill)
+            self._event_store._append_batch_in_connection(
+                connection=connection,
+                events=[fill_event],
+            )
+            self._order_journal._append_batch_in_connection(
+                connection=connection,
+                events=[fill_event],
+            )
+            return updated_order, fill_event
+
     def list_internal_order_snapshots(
         self, *, account_id: str | None = None
     ) -> list[InternalOrderSnapshot]:
@@ -1165,6 +1224,58 @@ class SQLiteOrderStore:
 
     def list_accounts_requiring_reconciliation(self) -> list[str]:
         return self._order_journal.list_active_account_ids()
+
+    def _load_latest_order_in_connection(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        client_order_id: str,
+    ) -> OrderAggregate | None:
+        row = connection.execute(
+            """
+            SELECT sequence_number, event_id, client_order_id, account_id, status, symbol, side,
+                   quantity, order_type, filled_quantity, average_fill_price, occurred_at
+            FROM order_journal
+            WHERE client_order_id = ?
+            ORDER BY sequence_number DESC
+            LIMIT 1
+            """,
+            (client_order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._order_journal._entry_from_row(row).to_order_aggregate()
+
+    def _load_domain_event_by_id_in_connection(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        event_id: str,
+    ) -> DomainEvent | None:
+        row = connection.execute(
+            """
+            SELECT event_id, event_type, aggregate_id, occurred_at, payload_json,
+                   correlation_id, causation_id, account_id, strategy_id, mode
+            FROM domain_events
+            WHERE event_id = ?
+            LIMIT 1
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return DomainEvent(
+            event_type=EventType(row["event_type"]),
+            aggregate_id=row["aggregate_id"],
+            payload=json.loads(row["payload_json"]),
+            event_id=row["event_id"],
+            occurred_at=datetime.fromisoformat(row["occurred_at"]),
+            correlation_id=row["correlation_id"],
+            causation_id=row["causation_id"],
+            account_id=row["account_id"],
+            strategy_id=row["strategy_id"],
+            mode=row["mode"],
+        )
 
     def record_reconciliation_report(
         self,

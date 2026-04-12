@@ -439,6 +439,89 @@ def test_execution_service_recovers_unknown_broker_outcome_without_resubmitting(
         )
 
 
+def test_execution_service_ingests_fill_durably_across_restart(db_path: Path) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    service = make_service(order_store=order_store)
+    order = make_order()
+
+    execution_result = service.execute_order(
+        order=order,
+        strategy_id="strat-a",
+        reference_price=50_000,
+        kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+        owner_id="worker-a",
+        existing_lease=None,
+    )
+
+    first_fill = service.ingest_fill(
+        client_order_id=order.client_order_id,
+        fill_id="fill-1",
+        fill_quantity=0.25,
+        fill_price=50_000.0,
+        occurred_at=datetime(2026, 1, 5, tzinfo=UTC),
+        broker_order_id=execution_result.broker_order_id,
+    )
+    restarted_service = make_service(order_store=SQLiteOrderStore(db_path=db_path))
+    final_fill = restarted_service.ingest_fill(
+        client_order_id=order.client_order_id,
+        fill_id="fill-2",
+        fill_quantity=0.75,
+        fill_price=50_400.0,
+        occurred_at=datetime(2026, 1, 5, 0, 0, 1, tzinfo=UTC),
+        broker_order_id=execution_result.broker_order_id,
+    )
+
+    restored_order = order_store.load_order(client_order_id=order.client_order_id)
+    snapshots = order_store.list_internal_order_snapshots(account_id="acct-1")
+
+    assert first_fill.order.status is OrderStatus.PARTIALLY_FILLED
+    assert first_fill.event.event_type.value == "order_partially_filled"
+    assert final_fill.order.status is OrderStatus.FILLED
+    assert final_fill.order.average_fill_price == 50300.0
+    assert restored_order == final_fill.order
+    assert snapshots[0].status == "filled"
+    assert snapshots[0].filled_quantity == 1.0
+
+
+
+def test_execution_service_replays_duplicate_fill_idempotently(db_path: Path) -> None:
+    order_store = SQLiteOrderStore(db_path=db_path)
+    order_store.initialize()
+    service = make_service(order_store=order_store)
+    order = make_order()
+
+    execution_result = service.execute_order(
+        order=order,
+        strategy_id="strat-a",
+        reference_price=50_000,
+        kill_switch=KillSwitch(account_id="acct-1", state=KillSwitchState.INACTIVE),
+        owner_id="worker-a",
+        existing_lease=None,
+    )
+
+    first_result = service.ingest_fill(
+        client_order_id=order.client_order_id,
+        fill_id="fill-1",
+        fill_quantity=1.0,
+        fill_price=50_100.0,
+        occurred_at=datetime(2026, 1, 5, tzinfo=UTC),
+        broker_order_id=execution_result.broker_order_id,
+    )
+    replayed_result = make_service(order_store=SQLiteOrderStore(db_path=db_path)).ingest_fill(
+        client_order_id=order.client_order_id,
+        fill_id="fill-1",
+        fill_quantity=1.0,
+        fill_price=50_100.0,
+        occurred_at=datetime(2026, 1, 5, tzinfo=UTC),
+        broker_order_id=execution_result.broker_order_id,
+    )
+
+    assert first_result == replayed_result
+    assert len(order_store.list_events(aggregate_id=order.client_order_id)) == 4
+
+
+
 def test_execution_service_allows_retry_after_explicitly_safe_broker_failure(db_path: Path) -> None:
     order_store = SQLiteOrderStore(db_path=db_path)
     order_store.initialize()

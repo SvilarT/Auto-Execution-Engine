@@ -1,7 +1,10 @@
 from auto_execution_engine.domain.events.models import EventType
+from datetime import UTC, datetime
+
 from auto_execution_engine.domain.orders.models import (
     OrderAggregate,
     OrderError,
+    OrderFill,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -63,7 +66,7 @@ def test_valid_transition_sequence_to_reconciled():
     )
     assert order.status is OrderStatus.FILLED
     assert order.filled_quantity == 2.0
-    assert order.average_fill_price == 50100.0
+    assert order.average_fill_price == 50050.0
     assert event.event_type is EventType.ORDER_FILLED
 
     order, event = order.transition(OrderStatus.RECONCILED)
@@ -93,3 +96,35 @@ def test_fill_quantity_cannot_exceed_order_quantity():
         assert False, "expected OrderError"
     except OrderError as exc:
         assert "cannot exceed" in str(exc)
+
+
+
+def test_apply_fill_generates_deterministic_fill_event_and_weighted_average():
+    order = make_order()
+    order, _ = order.transition(OrderStatus.RISK_APPROVED)
+    order, _ = order.transition(OrderStatus.SUBMITTED)
+
+    first_fill = OrderFill(
+        fill_id="fill-1",
+        quantity=0.5,
+        price=50_000.0,
+        occurred_at=datetime(2026, 1, 5, tzinfo=UTC),
+        broker_order_id="broker-1",
+    )
+    second_fill = OrderFill(
+        fill_id="fill-2",
+        quantity=1.5,
+        price=50_200.0,
+        occurred_at=datetime(2026, 1, 5, 0, 0, 1, tzinfo=UTC),
+        broker_order_id="broker-1",
+    )
+
+    order, first_event = order.apply_fill(fill=first_fill)
+    order, second_event = order.apply_fill(fill=second_fill)
+
+    assert first_event.event_id == f"fill::{order.client_order_id}::fill-1"
+    assert first_event.payload["fill_id"] == "fill-1"
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 2.0
+    assert order.average_fill_price == 50150.0
+    assert second_event.event_type is EventType.ORDER_FILLED

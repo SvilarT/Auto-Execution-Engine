@@ -23,6 +23,7 @@ from auto_execution_engine.adapters.persistence.sqlite_order_store import (
 from auto_execution_engine.domain.events.models import DomainEvent, EventType
 from auto_execution_engine.domain.orders.models import (
     OrderAggregate,
+    OrderFill,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -158,6 +159,88 @@ def test_order_store_persists_events_and_rehydrates_after_restart(db_path: Path)
         approved_event.event_id,
         submitted_event.event_id,
     ]
+
+
+def test_order_store_ingests_fills_durably_and_replays_latest_state(db_path: Path) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+
+    order = make_order()
+    created_event = order.create_event()
+    approved_order, approved_event = order.transition(OrderStatus.RISK_APPROVED)
+    submitted_order, submitted_event = approved_order.transition(OrderStatus.SUBMITTED)
+    store.record_events(events=[created_event, approved_event, submitted_event])
+
+    partially_filled_order, partial_event = store.ingest_fill(
+        client_order_id=order.client_order_id,
+        fill=OrderFill(
+            fill_id="fill-1",
+            quantity=3.0,
+            price=188.5,
+            occurred_at=datetime(2026, 1, 4, tzinfo=UTC),
+            broker_order_id="broker-123",
+        ),
+    )
+    filled_order, filled_event = store.ingest_fill(
+        client_order_id=order.client_order_id,
+        fill=OrderFill(
+            fill_id="fill-2",
+            quantity=7.0,
+            price=190.0,
+            occurred_at=datetime(2026, 1, 4, 0, 0, 1, tzinfo=UTC),
+            broker_order_id="broker-123",
+        ),
+    )
+
+    restarted_store = SQLiteOrderStore(db_path=db_path)
+    restored_order = restarted_store.load_order(client_order_id=order.client_order_id)
+    restored_history = restarted_store.load_order_history(client_order_id=order.client_order_id)
+
+    assert partially_filled_order.status is OrderStatus.PARTIALLY_FILLED
+    assert partial_event.event_type is EventType.ORDER_PARTIALLY_FILLED
+    assert filled_order.status is OrderStatus.FILLED
+    assert filled_order.filled_quantity == 10.0
+    assert filled_order.average_fill_price == 189.55
+    assert filled_event.event_id == f"fill::{order.client_order_id}::fill-2"
+    assert restored_order == filled_order
+    assert [entry.event_id for entry in restored_history[-2:]] == [
+        partial_event.event_id,
+        filled_event.event_id,
+    ]
+
+
+
+def test_order_store_replays_duplicate_fill_idempotently(db_path: Path) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+
+    order = make_order()
+    created_event = order.create_event()
+    approved_order, approved_event = order.transition(OrderStatus.RISK_APPROVED)
+    submitted_order, submitted_event = approved_order.transition(OrderStatus.SUBMITTED)
+    store.record_events(events=[created_event, approved_event, submitted_event])
+
+    fill = OrderFill(
+        fill_id="fill-1",
+        quantity=4.0,
+        price=189.25,
+        occurred_at=datetime(2026, 1, 4, tzinfo=UTC),
+        broker_order_id="broker-123",
+    )
+
+    first_order, first_event = store.ingest_fill(
+        client_order_id=order.client_order_id,
+        fill=fill,
+    )
+    replayed_order, replayed_event = store.ingest_fill(
+        client_order_id=order.client_order_id,
+        fill=fill,
+    )
+
+    assert replayed_order == first_order
+    assert replayed_event == first_event
+    assert len(store.list_events(aggregate_id=order.client_order_id)) == 4
+
 
 
 def test_order_store_projects_latest_internal_snapshots_for_reconciliation(

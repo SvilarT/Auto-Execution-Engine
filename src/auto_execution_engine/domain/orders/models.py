@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
@@ -55,7 +56,11 @@ _ALLOWED_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
         OrderStatus.FILLED,
         OrderStatus.CANCEL_PENDING,
     },
-    OrderStatus.CANCEL_PENDING: {OrderStatus.CANCELLED, OrderStatus.PARTIALLY_FILLED},
+    OrderStatus.CANCEL_PENDING: {
+        OrderStatus.CANCELLED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+    },
     OrderStatus.FILLED: {OrderStatus.RECONCILED},
     OrderStatus.CANCELLED: {OrderStatus.RECONCILED},
     OrderStatus.REJECTED: {OrderStatus.RECONCILED},
@@ -75,6 +80,18 @@ _EVENT_BY_STATUS: dict[OrderStatus, EventType] = {
     OrderStatus.CANCELLED: EventType.ORDER_CANCELLED,
     OrderStatus.RECONCILED: EventType.ORDER_RECONCILED,
 }
+
+
+@dataclass(frozen=True)
+class OrderFill:
+    """A durable downstream execution update emitted by a broker or simulator."""
+
+    fill_id: str
+    quantity: float
+    price: float
+    occurred_at: datetime
+    broker_order_id: str | None = None
+    source: str = "broker"
 
 
 @dataclass(frozen=True)
@@ -114,8 +131,11 @@ class OrderAggregate:
             raise OrderError("filled quantity cannot exceed total quantity")
 
         average_fill_price = self.average_fill_price
-        if fill_price is not None:
-            average_fill_price = fill_price
+        if fill_price is not None and fill_quantity_delta > 0:
+            average_fill_price = self._updated_average_fill_price(
+                fill_quantity_delta=fill_quantity_delta,
+                fill_price=fill_price,
+            )
 
         updated = OrderAggregate(
             account_id=self.account_id,
@@ -129,6 +149,58 @@ class OrderAggregate:
             average_fill_price=average_fill_price,
         )
         return updated, updated._event_for_status(next_status)
+
+    def apply_fill(self, *, fill: OrderFill) -> tuple["OrderAggregate", DomainEvent]:
+        if fill.quantity <= 0:
+            raise OrderError("fill quantity must be positive")
+        if fill.price <= 0:
+            raise OrderError("fill price must be positive")
+
+        next_filled_quantity = self.filled_quantity + fill.quantity
+        next_status = (
+            OrderStatus.FILLED
+            if abs(next_filled_quantity - self.quantity) <= 1e-9
+            else OrderStatus.PARTIALLY_FILLED
+        )
+        updated, event = self.transition(
+            next_status,
+            fill_quantity_delta=fill.quantity,
+            fill_price=fill.price,
+        )
+        payload = dict(event.payload)
+        payload.update(
+            {
+                "fill_id": fill.fill_id,
+                "last_fill_quantity": fill.quantity,
+                "last_fill_price": fill.price,
+                "fill_source": fill.source,
+                "broker_order_id": fill.broker_order_id,
+            }
+        )
+        return updated, DomainEvent(
+            event_type=event.event_type,
+            aggregate_id=event.aggregate_id,
+            payload=payload,
+            event_id=self.fill_event_id(fill_id=fill.fill_id),
+            occurred_at=fill.occurred_at,
+            correlation_id=event.correlation_id,
+            causation_id=event.causation_id,
+            account_id=event.account_id,
+            strategy_id=event.strategy_id,
+            mode=event.mode,
+        )
+
+    def fill_event_id(self, *, fill_id: str) -> str:
+        return f"fill::{self.client_order_id}::{fill_id}"
+
+    def _updated_average_fill_price(
+        self, *, fill_quantity_delta: float, fill_price: float
+    ) -> float:
+        prior_notional = 0.0
+        if self.average_fill_price is not None:
+            prior_notional = self.filled_quantity * self.average_fill_price
+        new_total_quantity = self.filled_quantity + fill_quantity_delta
+        return (prior_notional + (fill_quantity_delta * fill_price)) / new_total_quantity
 
     def _event_for_status(self, status: OrderStatus) -> DomainEvent:
         return DomainEvent(
