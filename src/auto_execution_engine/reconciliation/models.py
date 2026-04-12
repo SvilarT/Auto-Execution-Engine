@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -46,6 +44,19 @@ class BrokerOrderSnapshot:
 
 
 @dataclass(frozen=True)
+class PositionSnapshot:
+    account_id: str
+    symbol: str
+    quantity: float
+
+
+@dataclass(frozen=True)
+class CashSnapshot:
+    account_id: str
+    balance: float
+
+
+@dataclass(frozen=True)
 class ReconciliationDrift:
     category: DriftCategory
     account_id: str
@@ -72,6 +83,10 @@ class ReconciliationCycleRecord:
     internal_orders: tuple[InternalOrderSnapshot, ...]
     broker_orders: tuple[BrokerOrderSnapshot, ...]
     report: ReconciliationReport
+    internal_positions: tuple[PositionSnapshot, ...] = ()
+    broker_positions: tuple[PositionSnapshot, ...] = ()
+    internal_cash: CashSnapshot | None = None
+    broker_cash: CashSnapshot | None = None
 
 
 @dataclass(frozen=True)

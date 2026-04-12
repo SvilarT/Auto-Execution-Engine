@@ -24,8 +24,10 @@ from auto_execution_engine.domain.orders.models import (
 )
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
+    CashSnapshot,
     DriftCategory,
     InternalOrderSnapshot,
+    PositionSnapshot,
     ReconciliationAction,
     ReconciliationCycleRecord,
     ReconciliationDrift,
@@ -33,6 +35,7 @@ from auto_execution_engine.reconciliation.models import (
     ReconciliationRunRecord,
     ReconciliationRunStatus,
 )
+from auto_execution_engine.reconciliation.projections import EventLogProjectionService
 from auto_execution_engine.trading_plane.leases import (
     AccountLease,
     AccountLeaseBackend,
@@ -180,7 +183,11 @@ class _SQLiteStore:
                 action TEXT NOT NULL,
                 drifts_json TEXT NOT NULL,
                 internal_orders_json TEXT NOT NULL DEFAULT '[]',
-                broker_orders_json TEXT NOT NULL DEFAULT '[]'
+                broker_orders_json TEXT NOT NULL DEFAULT '[]',
+                internal_positions_json TEXT NOT NULL DEFAULT '[]',
+                broker_positions_json TEXT NOT NULL DEFAULT '[]',
+                internal_cash_json TEXT,
+                broker_cash_json TEXT
             )
             """
         )
@@ -197,6 +204,22 @@ class _SQLiteStore:
         if "broker_orders_json" not in existing_report_columns:
             connection.execute(
                 "ALTER TABLE reconciliation_reports ADD COLUMN broker_orders_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "internal_positions_json" not in existing_report_columns:
+            connection.execute(
+                "ALTER TABLE reconciliation_reports ADD COLUMN internal_positions_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "broker_positions_json" not in existing_report_columns:
+            connection.execute(
+                "ALTER TABLE reconciliation_reports ADD COLUMN broker_positions_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "internal_cash_json" not in existing_report_columns:
+            connection.execute(
+                "ALTER TABLE reconciliation_reports ADD COLUMN internal_cash_json TEXT"
+            )
+        if "broker_cash_json" not in existing_report_columns:
+            connection.execute(
+                "ALTER TABLE reconciliation_reports ADD COLUMN broker_cash_json TEXT"
             )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_reconciliation_reports_account ON reconciliation_reports(account_id, report_sequence)"
@@ -590,6 +613,10 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
         report: ReconciliationReport,
         internal_orders: Iterable[InternalOrderSnapshot] = (),
         broker_orders: Iterable[BrokerOrderSnapshot] = (),
+        internal_positions: Iterable[PositionSnapshot] = (),
+        broker_positions: Iterable[PositionSnapshot] = (),
+        internal_cash: CashSnapshot | None = None,
+        broker_cash: CashSnapshot | None = None,
     ) -> None:
         serialized_drifts = [
             {
@@ -620,6 +647,34 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
             }
             for order in broker_orders
         ]
+        serialized_internal_positions = [
+            {
+                "account_id": position.account_id,
+                "symbol": position.symbol,
+                "quantity": position.quantity,
+            }
+            for position in internal_positions
+        ]
+        serialized_broker_positions = [
+            {
+                "account_id": position.account_id,
+                "symbol": position.symbol,
+                "quantity": position.quantity,
+            }
+            for position in broker_positions
+        ]
+        serialized_internal_cash = None
+        if internal_cash is not None:
+            serialized_internal_cash = {
+                "account_id": internal_cash.account_id,
+                "balance": internal_cash.balance,
+            }
+        serialized_broker_cash = None
+        if broker_cash is not None:
+            serialized_broker_cash = {
+                "account_id": broker_cash.account_id,
+                "balance": broker_cash.balance,
+            }
         with self._connect() as connection:
             self._initialize_schema(connection)
             connection.execute(
@@ -630,8 +685,12 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
                     action,
                     drifts_json,
                     internal_orders_json,
-                    broker_orders_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    broker_orders_json,
+                    internal_positions_json,
+                    broker_positions_json,
+                    internal_cash_json,
+                    broker_cash_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     report.account_id,
@@ -640,6 +699,14 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
                     json.dumps(serialized_drifts, sort_keys=True),
                     json.dumps(serialized_internal_orders, sort_keys=True),
                     json.dumps(serialized_broker_orders, sort_keys=True),
+                    json.dumps(serialized_internal_positions, sort_keys=True),
+                    json.dumps(serialized_broker_positions, sort_keys=True),
+                    json.dumps(serialized_internal_cash, sort_keys=True)
+                    if serialized_internal_cash is not None
+                    else None,
+                    json.dumps(serialized_broker_cash, sort_keys=True)
+                    if serialized_broker_cash is not None
+                    else None,
                 ),
             )
 
@@ -654,7 +721,8 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
             self._initialize_schema(connection)
             row = connection.execute(
                 """
-                SELECT account_id, generated_at, action, drifts_json, internal_orders_json, broker_orders_json
+                SELECT account_id, generated_at, action, drifts_json, internal_orders_json, broker_orders_json,
+                       internal_positions_json, broker_positions_json, internal_cash_json, broker_cash_json
                 FROM reconciliation_reports
                 WHERE account_id = ?
                 ORDER BY report_sequence DESC
@@ -672,7 +740,8 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
             self._initialize_schema(connection)
             rows = connection.execute(
                 """
-                SELECT account_id, generated_at, action, drifts_json, internal_orders_json, broker_orders_json
+                SELECT account_id, generated_at, action, drifts_json, internal_orders_json, broker_orders_json,
+                       internal_positions_json, broker_positions_json, internal_cash_json, broker_cash_json
                 FROM reconciliation_reports
                 WHERE account_id = ?
                 ORDER BY report_sequence ASC
@@ -766,6 +835,18 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
         drifts_payload = json.loads(row["drifts_json"])
         internal_payload = json.loads(row["internal_orders_json"])
         broker_payload = json.loads(row["broker_orders_json"])
+        internal_positions_payload = json.loads(row["internal_positions_json"])
+        broker_positions_payload = json.loads(row["broker_positions_json"])
+        internal_cash_payload = (
+            json.loads(row["internal_cash_json"])
+            if row["internal_cash_json"] is not None
+            else None
+        )
+        broker_cash_payload = (
+            json.loads(row["broker_cash_json"])
+            if row["broker_cash_json"] is not None
+            else None
+        )
         generated_at = datetime.fromisoformat(row["generated_at"])
         report = self._report_from_payload(
             {
@@ -799,6 +880,38 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
                 for order in broker_payload
             ),
             report=report,
+            internal_positions=tuple(
+                PositionSnapshot(
+                    account_id=str(position["account_id"]),
+                    symbol=str(position["symbol"]),
+                    quantity=float(position["quantity"]),
+                )
+                for position in internal_positions_payload
+            ),
+            broker_positions=tuple(
+                PositionSnapshot(
+                    account_id=str(position["account_id"]),
+                    symbol=str(position["symbol"]),
+                    quantity=float(position["quantity"]),
+                )
+                for position in broker_positions_payload
+            ),
+            internal_cash=(
+                CashSnapshot(
+                    account_id=str(internal_cash_payload["account_id"]),
+                    balance=float(internal_cash_payload["balance"]),
+                )
+                if internal_cash_payload is not None
+                else None
+            ),
+            broker_cash=(
+                CashSnapshot(
+                    account_id=str(broker_cash_payload["account_id"]),
+                    balance=float(broker_cash_payload["balance"]),
+                )
+                if broker_cash_payload is not None
+                else None
+            ),
         )
 
     def _run_from_row(self, row: sqlite3.Row) -> ReconciliationRunRecord:
@@ -1079,6 +1192,7 @@ class SQLiteOrderStore:
         self._submission_book = SQLiteSubmissionBook(db_path=self.db_path)
         self._lease_backend = SQLiteAccountLeaseBackend(db_path=self.db_path)
         self._rehydrator = OrderAggregateRehydrator()
+        self._projection_service = EventLogProjectionService()
 
     def initialize(self) -> None:
         self._event_store.initialize()
@@ -1103,8 +1217,16 @@ class SQLiteOrderStore:
                 events=events,
             )
 
-    def list_events(self, *, aggregate_id: str) -> list[DomainEvent]:
-        return self._event_store.list_events(aggregate_id=aggregate_id)
+    def list_events(
+        self,
+        *,
+        aggregate_id: str | None = None,
+        account_id: str | None = None,
+    ) -> list[DomainEvent]:
+        return self._event_store.list_events(
+            aggregate_id=aggregate_id,
+            account_id=account_id,
+        )
 
     def load_order(self, *, client_order_id: str) -> OrderAggregate:
         events = self._event_store.list_events(aggregate_id=client_order_id)
@@ -1179,6 +1301,29 @@ class SQLiteOrderStore:
     ) -> list[InternalOrderSnapshot]:
         entries = self._order_journal.list_latest_entries(account_id=account_id)
         return [entry.to_internal_order_snapshot() for entry in entries]
+
+    def project_internal_positions(
+        self, *, account_id: str, events: Iterable[DomainEvent] | None = None
+    ) -> list[PositionSnapshot]:
+        replay_events = list(events) if events is not None else self.list_events(account_id=account_id)
+        return self._projection_service.rebuild_positions(
+            account_id=account_id,
+            events=replay_events,
+        )
+
+    def project_internal_cash(
+        self,
+        *,
+        account_id: str,
+        opening_balance: float = 0.0,
+        events: Iterable[DomainEvent] | None = None,
+    ) -> CashSnapshot:
+        replay_events = list(events) if events is not None else self.list_events(account_id=account_id)
+        return self._projection_service.rebuild_cash(
+            account_id=account_id,
+            events=replay_events,
+            opening_balance=opening_balance,
+        )
 
     def repair_orders_from_submissions(self, *, account_id: str | None = None) -> list[str]:
         repaired_client_order_ids: list[str] = []
@@ -1283,11 +1428,19 @@ class SQLiteOrderStore:
         report: ReconciliationReport,
         internal_orders: Iterable[InternalOrderSnapshot] = (),
         broker_orders: Iterable[BrokerOrderSnapshot] = (),
+        internal_positions: Iterable[PositionSnapshot] = (),
+        broker_positions: Iterable[PositionSnapshot] = (),
+        internal_cash: CashSnapshot | None = None,
+        broker_cash: CashSnapshot | None = None,
     ) -> None:
         self._reconciliation_reports.append(
             report=report,
             internal_orders=internal_orders,
             broker_orders=broker_orders,
+            internal_positions=internal_positions,
+            broker_positions=broker_positions,
+            internal_cash=internal_cash,
+            broker_cash=broker_cash,
         )
 
     def load_latest_reconciliation_report(

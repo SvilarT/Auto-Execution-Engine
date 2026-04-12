@@ -30,8 +30,10 @@ from auto_execution_engine.domain.orders.models import (
 )
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
+    CashSnapshot,
     DriftCategory,
     InternalOrderSnapshot,
+    PositionSnapshot,
     ReconciliationAction,
     ReconciliationDrift,
     ReconciliationReport,
@@ -297,6 +299,61 @@ def test_order_store_projects_latest_internal_snapshots_for_reconciliation(
     ]
 
 
+def test_order_store_projects_internal_positions_and_cash_from_fill_events(
+    db_path: Path,
+) -> None:
+    store = SQLiteOrderStore(db_path=db_path)
+    store.initialize()
+
+    buy_order = make_order(client_order_id="client-buy")
+    buy_created = buy_order.create_event()
+    buy_approved_order, buy_approved = buy_order.transition(OrderStatus.RISK_APPROVED)
+    buy_submitted_order, buy_submitted = buy_approved_order.transition(OrderStatus.SUBMITTED)
+    _, buy_fill = buy_submitted_order.transition(
+        OrderStatus.PARTIALLY_FILLED,
+        fill_quantity_delta=4,
+        fill_price=188.5,
+    )
+
+    sell_order = OrderAggregate(
+        account_id="acct-1",
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        quantity=2,
+        order_type=OrderType.MARKET,
+        client_order_id="client-sell",
+    )
+    sell_created = sell_order.create_event()
+    sell_approved_order, sell_approved = sell_order.transition(OrderStatus.RISK_APPROVED)
+    sell_submitted_order, sell_submitted = sell_approved_order.transition(OrderStatus.SUBMITTED)
+    _, sell_fill = sell_submitted_order.transition(
+        OrderStatus.FILLED,
+        fill_quantity_delta=2,
+        fill_price=191.0,
+    )
+
+    store.record_events(
+        events=[
+            buy_created,
+            buy_approved,
+            buy_submitted,
+            buy_fill,
+            sell_created,
+            sell_approved,
+            sell_submitted,
+            sell_fill,
+        ]
+    )
+
+    assert store.project_internal_positions(account_id="acct-1") == [
+        PositionSnapshot(account_id="acct-1", symbol="AAPL", quantity=2.0)
+    ]
+    assert store.project_internal_cash(account_id="acct-1", opening_balance=1000.0) == (
+        CashSnapshot(account_id="acct-1", balance=628.0)
+    )
+
+
+
 def test_order_store_persists_reconciliation_cycle_inputs_and_latest_report(
     db_path: Path,
 ) -> None:
@@ -334,11 +391,23 @@ def test_order_store_persists_reconciliation_cycle_inputs_and_latest_report(
             symbol="AAPL",
         )
     ]
+    internal_positions = [
+        PositionSnapshot(account_id="acct-1", symbol="AAPL", quantity=3.0)
+    ]
+    broker_positions = [
+        PositionSnapshot(account_id="acct-1", symbol="AAPL", quantity=0.0)
+    ]
+    internal_cash = CashSnapshot(account_id="acct-1", balance=-565.5)
+    broker_cash = CashSnapshot(account_id="acct-1", balance=0.0)
 
     store.record_reconciliation_report(
         report=report,
         internal_orders=internal_orders,
         broker_orders=broker_orders,
+        internal_positions=internal_positions,
+        broker_positions=broker_positions,
+        internal_cash=internal_cash,
+        broker_cash=broker_cash,
     )
 
     restarted_store = SQLiteOrderStore(db_path=db_path)
@@ -351,6 +420,10 @@ def test_order_store_persists_reconciliation_cycle_inputs_and_latest_report(
     assert latest_cycle.report == report
     assert latest_cycle.internal_orders == tuple(internal_orders)
     assert latest_cycle.broker_orders == tuple(broker_orders)
+    assert latest_cycle.internal_positions == tuple(internal_positions)
+    assert latest_cycle.broker_positions == tuple(broker_positions)
+    assert latest_cycle.internal_cash == internal_cash
+    assert latest_cycle.broker_cash == broker_cash
     assert cycles == [latest_cycle]
 
 

@@ -17,6 +17,7 @@ from auto_execution_engine.domain.events.models import DomainEvent
 from auto_execution_engine.domain.orders.models import OrderAggregate, OrderFill, OrderStatus
 from auto_execution_engine.domain.risk.models import KillSwitch, OrderIntent, RiskDecision
 from auto_execution_engine.domain.risk.service import RiskService
+from auto_execution_engine.reconciliation.models import CashSnapshot, PositionSnapshot
 from auto_execution_engine.reconciliation.service import ReconciliationQuarantineError
 from auto_execution_engine.trading_plane.leases import AccountLease, AccountLeaseService, LeaseError
 
@@ -34,6 +35,15 @@ class DurableOrderStore(Protocol):
         client_order_id: str,
         fill: OrderFill,
     ) -> tuple[OrderAggregate, DomainEvent]: ...
+
+    def project_internal_positions(self, *, account_id: str) -> list[PositionSnapshot]: ...
+
+    def project_internal_cash(
+        self,
+        *,
+        account_id: str,
+        opening_balance: float = 0.0,
+    ) -> CashSnapshot: ...
 
 
 class AccountExecutionGate(Protocol):

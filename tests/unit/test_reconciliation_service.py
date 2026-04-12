@@ -1,14 +1,16 @@
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
+    CashSnapshot,
     DriftCategory,
     InternalOrderSnapshot,
+    PositionSnapshot,
     ReconciliationAction,
 )
 from auto_execution_engine.reconciliation.service import ReconciliationService
 
 
 
-def test_reconciliation_returns_no_action_when_states_match():
+def test_reconciliation_returns_no_action_when_states_match() -> None:
     service = ReconciliationService()
 
     report = service.compare_orders(
@@ -31,6 +33,14 @@ def test_reconciliation_returns_no_action_when_states_match():
                 symbol="BTC-USD",
             )
         ],
+        internal_positions=[
+            PositionSnapshot(account_id="acct-1", symbol="BTC-USD", quantity=1.0)
+        ],
+        broker_positions=[
+            PositionSnapshot(account_id="acct-1", symbol="BTC-USD", quantity=1.0)
+        ],
+        internal_cash=CashSnapshot(account_id="acct-1", balance=-50000.0),
+        broker_cash=CashSnapshot(account_id="acct-1", balance=-50000.0),
     )
 
     assert report.has_drift is False
@@ -38,7 +48,7 @@ def test_reconciliation_returns_no_action_when_states_match():
 
 
 
-def test_reconciliation_quarantines_when_broker_order_is_missing():
+def test_reconciliation_quarantines_when_broker_order_is_missing() -> None:
     service = ReconciliationService()
 
     report = service.compare_orders(
@@ -61,7 +71,7 @@ def test_reconciliation_quarantines_when_broker_order_is_missing():
 
 
 
-def test_reconciliation_quarantines_when_broker_has_unknown_order():
+def test_reconciliation_quarantines_when_broker_has_unknown_order() -> None:
     service = ReconciliationService()
 
     report = service.compare_orders(
@@ -84,7 +94,7 @@ def test_reconciliation_quarantines_when_broker_has_unknown_order():
 
 
 
-def test_reconciliation_quarantines_on_status_mismatch():
+def test_reconciliation_quarantines_on_status_and_fill_mismatch() -> None:
     service = ReconciliationService()
 
     report = service.compare_orders(
@@ -115,3 +125,49 @@ def test_reconciliation_quarantines_on_status_mismatch():
         DriftCategory.ORDER_STATUS_MISMATCH,
         DriftCategory.FILLED_QUANTITY_MISMATCH,
     }
+
+
+
+def test_reconciliation_quarantines_on_position_mismatch() -> None:
+    service = ReconciliationService()
+
+    report = service.compare_orders(
+        account_id="acct-1",
+        internal_orders=[],
+        broker_orders=[],
+        internal_positions=[
+            PositionSnapshot(account_id="acct-1", symbol="AAPL", quantity=10.0)
+        ],
+        broker_positions=[
+            PositionSnapshot(account_id="acct-1", symbol="AAPL", quantity=9.0)
+        ],
+    )
+
+    assert report.has_drift is True
+    assert report.action is ReconciliationAction.QUARANTINE_ACCOUNT
+    assert report.drifts == (
+        report.drifts[0],
+    )
+    assert report.drifts[0].category is DriftCategory.POSITION_MISMATCH
+    assert "AAPL" in report.drifts[0].detail
+
+
+
+def test_reconciliation_quarantines_on_cash_mismatch() -> None:
+    service = ReconciliationService()
+
+    report = service.compare_orders(
+        account_id="acct-1",
+        internal_orders=[],
+        broker_orders=[],
+        internal_cash=CashSnapshot(account_id="acct-1", balance=1000.0),
+        broker_cash=CashSnapshot(account_id="acct-1", balance=995.0),
+    )
+
+    assert report.has_drift is True
+    assert report.action is ReconciliationAction.QUARANTINE_ACCOUNT
+    assert report.drifts == (
+        report.drifts[0],
+    )
+    assert report.drifts[0].category is DriftCategory.CASH_MISMATCH
+    assert "1000.0" in report.drifts[0].detail

@@ -14,12 +14,16 @@ from auto_execution_engine.config.execution_mode import (
 )
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
+    CashSnapshot,
+    PositionSnapshot,
     ReconciliationReport,
     ReconciliationRunRecord,
 )
 
 
 BrokerSnapshotByAccount = dict[str, list[BrokerOrderSnapshot]]
+BrokerPositionsByAccount = dict[str, list[PositionSnapshot]]
+BrokerCashByAccount = dict[str, CashSnapshot]
 from auto_execution_engine.reconciliation.runner import ReconciliationRunner
 from auto_execution_engine.reconciliation.service import (
     AccountQuarantineRegistry,
@@ -149,6 +153,9 @@ def reconcile_account_startup_state(
     context: StartupContext,
     account_id: str,
     broker_orders: list[BrokerOrderSnapshot],
+    broker_positions: list[PositionSnapshot] | None = None,
+    broker_cash: CashSnapshot | None = None,
+    opening_cash_balance: float = 0.0,
     order_store: SQLiteOrderStore | None = None,
     reconciliation_service: ReconciliationService | None = None,
     quarantine_registry: AccountQuarantineRegistry | None = None,
@@ -157,17 +164,30 @@ def reconcile_account_startup_state(
     store = order_store or build_order_store(context=context)
     store.repair_orders_from_submissions(account_id=account_id)
     internal_orders = store.list_internal_order_snapshots(account_id=account_id)
+    internal_positions = store.project_internal_positions(account_id=account_id)
+    internal_cash = store.project_internal_cash(
+        account_id=account_id,
+        opening_balance=opening_cash_balance,
+    )
     service = reconciliation_service or ReconciliationService()
     report = service.compare_orders(
         account_id=account_id,
         internal_orders=internal_orders,
         broker_orders=broker_orders,
+        internal_positions=internal_positions,
+        broker_positions=broker_positions,
+        internal_cash=internal_cash,
+        broker_cash=broker_cash,
     )
     if persist_report:
         store.record_reconciliation_report(
             report=report,
             internal_orders=internal_orders,
             broker_orders=broker_orders,
+            internal_positions=internal_positions,
+            broker_positions=broker_positions or (),
+            internal_cash=internal_cash,
+            broker_cash=broker_cash,
         )
     if quarantine_registry is not None:
         quarantine_registry.record(report=report)
@@ -178,6 +198,9 @@ def reconcile_all_startup_accounts(
     *,
     context: StartupContext,
     broker_snapshots_by_account: BrokerSnapshotByAccount,
+    broker_positions_by_account: BrokerPositionsByAccount | None = None,
+    broker_cash_by_account: BrokerCashByAccount | None = None,
+    opening_cash_by_account: dict[str, float] | None = None,
     order_store: SQLiteOrderStore | None = None,
     reconciliation_service: ReconciliationService | None = None,
     quarantine_registry: AccountQuarantineRegistry | None = None,
@@ -189,7 +212,12 @@ def reconcile_all_startup_accounts(
         reconciliation_service=reconciliation_service,
         owner_id="startup-reconciliation-runner",
     )
-    records = runner.run_once(broker_snapshots_by_account=broker_snapshots_by_account)
+    records = runner.run_once(
+        broker_snapshots_by_account=broker_snapshots_by_account,
+        broker_positions_by_account=broker_positions_by_account,
+        broker_cash_by_account=broker_cash_by_account,
+        opening_cash_by_account=opening_cash_by_account,
+    )
     return [record.report for record in records if record.report is not None]
 
 

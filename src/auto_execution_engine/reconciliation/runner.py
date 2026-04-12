@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+
+from auto_execution_engine.reconciliation.models import CashSnapshot, PositionSnapshot
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -21,6 +23,8 @@ from auto_execution_engine.reconciliation.service import (
 from auto_execution_engine.trading_plane.leases import AccountLeaseService, LeaseError
 
 BrokerSnapshotLoader = Callable[[str], list[BrokerOrderSnapshot]]
+BrokerPositionLoader = Callable[[str], list[PositionSnapshot]]
+BrokerCashLoader = Callable[[str], CashSnapshot | None]
 
 
 class ReconciliationRunner:
@@ -48,7 +52,12 @@ class ReconciliationRunner:
         *,
         account_ids: Iterable[str] | None = None,
         broker_snapshots_by_account: Mapping[str, list[BrokerOrderSnapshot]] | None = None,
+        broker_positions_by_account: Mapping[str, list[PositionSnapshot]] | None = None,
+        broker_cash_by_account: Mapping[str, CashSnapshot] | None = None,
+        opening_cash_by_account: Mapping[str, float] | None = None,
         snapshot_loader: BrokerSnapshotLoader | None = None,
+        broker_position_loader: BrokerPositionLoader | None = None,
+        broker_cash_loader: BrokerCashLoader | None = None,
         now: datetime | None = None,
     ) -> list[ReconciliationRunRecord]:
         current_time = now or datetime.now(UTC)
@@ -57,7 +66,12 @@ class ReconciliationRunner:
             self._run_account(
                 account_id=account_id,
                 broker_snapshots_by_account=broker_snapshots_by_account,
+                broker_positions_by_account=broker_positions_by_account,
+                broker_cash_by_account=broker_cash_by_account,
+                opening_cash_by_account=opening_cash_by_account,
                 snapshot_loader=snapshot_loader,
+                broker_position_loader=broker_position_loader,
+                broker_cash_loader=broker_cash_loader,
                 now=current_time,
             )
             for account_id in resolved_account_ids
@@ -73,7 +87,12 @@ class ReconciliationRunner:
         *,
         account_id: str,
         broker_snapshots_by_account: Mapping[str, list[BrokerOrderSnapshot]] | None,
+        broker_positions_by_account: Mapping[str, list[PositionSnapshot]] | None,
+        broker_cash_by_account: Mapping[str, CashSnapshot] | None,
+        opening_cash_by_account: Mapping[str, float] | None,
         snapshot_loader: BrokerSnapshotLoader | None,
+        broker_position_loader: BrokerPositionLoader | None,
+        broker_cash_loader: BrokerCashLoader | None,
         now: datetime,
     ) -> ReconciliationRunRecord:
         run_id = str(uuid4())
@@ -104,20 +123,48 @@ class ReconciliationRunner:
             internal_orders = self._order_store.list_internal_order_snapshots(
                 account_id=account_id
             )
+            opening_balance = 0.0
+            if opening_cash_by_account is not None:
+                opening_balance = float(opening_cash_by_account.get(account_id, 0.0))
+            internal_positions = self._order_store.project_internal_positions(
+                account_id=account_id
+            )
+            internal_cash = self._order_store.project_internal_cash(
+                account_id=account_id,
+                opening_balance=opening_balance,
+            )
             broker_orders = self._resolve_broker_orders(
                 account_id=account_id,
                 broker_snapshots_by_account=broker_snapshots_by_account,
                 snapshot_loader=snapshot_loader,
             )
+            broker_positions = self._resolve_broker_positions(
+                account_id=account_id,
+                broker_positions_by_account=broker_positions_by_account,
+                broker_position_loader=broker_position_loader,
+            )
+            broker_cash = self._resolve_broker_cash(
+                account_id=account_id,
+                broker_cash_by_account=broker_cash_by_account,
+                broker_cash_loader=broker_cash_loader,
+            )
             report = self._reconciliation_service.compare_orders(
                 account_id=account_id,
                 internal_orders=internal_orders,
                 broker_orders=broker_orders,
+                internal_positions=internal_positions,
+                broker_positions=broker_positions,
+                internal_cash=internal_cash,
+                broker_cash=broker_cash,
             )
             self._order_store.record_reconciliation_report(
                 report=report,
                 internal_orders=internal_orders,
                 broker_orders=broker_orders,
+                internal_positions=internal_positions,
+                broker_positions=broker_positions or (),
+                internal_cash=internal_cash,
+                broker_cash=broker_cash,
             )
             if self._quarantine_registry is not None:
                 self._quarantine_registry.record(report=report)
@@ -187,3 +234,29 @@ class ReconciliationRunner:
         if snapshot_loader is not None:
             return list(snapshot_loader(account_id))
         return []
+
+    def _resolve_broker_positions(
+        self,
+        *,
+        account_id: str,
+        broker_positions_by_account: Mapping[str, list[PositionSnapshot]] | None,
+        broker_position_loader: BrokerPositionLoader | None,
+    ) -> list[PositionSnapshot] | None:
+        if broker_positions_by_account is not None:
+            return list(broker_positions_by_account.get(account_id, []))
+        if broker_position_loader is not None:
+            return list(broker_position_loader(account_id))
+        return None
+
+    def _resolve_broker_cash(
+        self,
+        *,
+        account_id: str,
+        broker_cash_by_account: Mapping[str, CashSnapshot] | None,
+        broker_cash_loader: BrokerCashLoader | None,
+    ) -> CashSnapshot | None:
+        if broker_cash_by_account is not None:
+            return broker_cash_by_account.get(account_id)
+        if broker_cash_loader is not None:
+            return broker_cash_loader(account_id)
+        return None

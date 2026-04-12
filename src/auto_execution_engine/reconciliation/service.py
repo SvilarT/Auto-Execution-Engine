@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
+    CashSnapshot,
     DriftCategory,
     InternalOrderSnapshot,
+    PositionSnapshot,
     ReconciliationAction,
     ReconciliationDrift,
     ReconciliationReport,
@@ -15,6 +15,8 @@ from auto_execution_engine.reconciliation.models import (
 QUARANTINE_CATEGORIES = {
     DriftCategory.ORDER_STATUS_MISMATCH,
     DriftCategory.FILLED_QUANTITY_MISMATCH,
+    DriftCategory.POSITION_MISMATCH,
+    DriftCategory.CASH_MISMATCH,
     DriftCategory.UNKNOWN_BROKER_ORDER,
     DriftCategory.MISSING_BROKER_ORDER,
     DriftCategory.RECONCILIATION_RUN_FAILURE,
@@ -65,6 +67,10 @@ class ReconciliationService:
         account_id: str,
         internal_orders: list[InternalOrderSnapshot],
         broker_orders: list[BrokerOrderSnapshot],
+        internal_positions: list[PositionSnapshot] | None = None,
+        broker_positions: list[PositionSnapshot] | None = None,
+        internal_cash: CashSnapshot | None = None,
+        broker_cash: CashSnapshot | None = None,
     ) -> ReconciliationReport:
         internal_by_id = {order.client_order_id: order for order in internal_orders}
         broker_by_id = {order.client_order_id: order for order in broker_orders}
@@ -121,6 +127,21 @@ class ReconciliationService:
                     )
                 )
 
+        drifts.extend(
+            self._compare_positions(
+                account_id=account_id,
+                internal_positions=internal_positions,
+                broker_positions=broker_positions,
+            )
+        )
+        cash_drift = self._compare_cash(
+            account_id=account_id,
+            internal_cash=internal_cash,
+            broker_cash=broker_cash,
+        )
+        if cash_drift is not None:
+            drifts.append(cash_drift)
+
         action = ReconciliationAction.NO_ACTION
         if drifts:
             action = ReconciliationAction.LOG_ONLY
@@ -131,4 +152,56 @@ class ReconciliationService:
             account_id=account_id,
             drifts=tuple(drifts),
             action=action,
+        )
+
+    def _compare_positions(
+        self,
+        *,
+        account_id: str,
+        internal_positions: list[PositionSnapshot] | None,
+        broker_positions: list[PositionSnapshot] | None,
+    ) -> list[ReconciliationDrift]:
+        if internal_positions is None or broker_positions is None:
+            return []
+
+        internal_by_symbol = {snapshot.symbol: snapshot.quantity for snapshot in internal_positions}
+        broker_by_symbol = {snapshot.symbol: snapshot.quantity for snapshot in broker_positions}
+        drifts: list[ReconciliationDrift] = []
+
+        for symbol in sorted(set(internal_by_symbol) | set(broker_by_symbol)):
+            internal_quantity = internal_by_symbol.get(symbol, 0.0)
+            broker_quantity = broker_by_symbol.get(symbol, 0.0)
+            if abs(internal_quantity - broker_quantity) <= 1e-9:
+                continue
+            drifts.append(
+                ReconciliationDrift(
+                    category=DriftCategory.POSITION_MISMATCH,
+                    account_id=account_id,
+                    client_order_id=None,
+                    detail=(
+                        f"internal position for {symbol} is {internal_quantity} while broker position is {broker_quantity}"
+                    ),
+                )
+            )
+
+        return drifts
+
+    def _compare_cash(
+        self,
+        *,
+        account_id: str,
+        internal_cash: CashSnapshot | None,
+        broker_cash: CashSnapshot | None,
+    ) -> ReconciliationDrift | None:
+        if internal_cash is None or broker_cash is None:
+            return None
+        if abs(internal_cash.balance - broker_cash.balance) <= 1e-9:
+            return None
+        return ReconciliationDrift(
+            category=DriftCategory.CASH_MISMATCH,
+            account_id=account_id,
+            client_order_id=None,
+            detail=(
+                f"internal cash balance is {internal_cash.balance} while broker cash balance is {broker_cash.balance}"
+            ),
         )
