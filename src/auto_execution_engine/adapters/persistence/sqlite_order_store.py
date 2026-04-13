@@ -3,7 +3,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TypedDict, cast
 
 from auto_execution_engine.adapters.broker.models import (
     BrokerRetryDisposition,
@@ -69,6 +69,20 @@ class PersistenceError(ValueError):
 
 class DuplicateEventError(PersistenceError):
     """Raised when an immutable event is appended more than once."""
+
+
+class ReconciliationDriftPayload(TypedDict):
+    category: str
+    account_id: str
+    client_order_id: str | None
+    detail: str
+
+
+class ReconciliationReportPayload(TypedDict):
+    account_id: str
+    generated_at: str
+    action: str
+    drifts: list[ReconciliationDriftPayload]
 
 
 @dataclass(frozen=True)
@@ -927,7 +941,9 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
     def _run_from_row(self, row: sqlite3.Row) -> ReconciliationRunRecord:
         report = None
         if row["report_json"] is not None:
-            report = self._report_from_payload(json.loads(row["report_json"]))
+            report = self._report_from_payload(
+                cast(ReconciliationReportPayload, json.loads(row["report_json"]))
+            )
         return ReconciliationRunRecord(
             run_id=str(row["run_id"]),
             account_id=str(row["account_id"]),
@@ -939,37 +955,33 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
             report=report,
         )
 
-    def _serialize_report(self, report: ReconciliationReport) -> dict[str, object]:
-        return {
-            "account_id": report.account_id,
-            "generated_at": report.generated_at.isoformat(),
-            "action": report.action.value,
-            "drifts": [
-                {
-                    "category": drift.category.value,
-                    "account_id": drift.account_id,
-                    "client_order_id": drift.client_order_id,
-                    "detail": drift.detail,
-                }
+    def _serialize_report(self, report: ReconciliationReport) -> ReconciliationReportPayload:
+        return ReconciliationReportPayload(
+            account_id=report.account_id,
+            generated_at=report.generated_at.isoformat(),
+            action=report.action.value,
+            drifts=[
+                ReconciliationDriftPayload(
+                    category=drift.category.value,
+                    account_id=drift.account_id,
+                    client_order_id=drift.client_order_id,
+                    detail=drift.detail,
+                )
                 for drift in report.drifts
             ],
-        }
+        )
 
-    def _report_from_payload(self, payload: dict[str, object]) -> ReconciliationReport:
+    def _report_from_payload(self, payload: ReconciliationReportPayload) -> ReconciliationReport:
         return ReconciliationReport(
-            account_id=str(payload["account_id"]),
-            generated_at=datetime.fromisoformat(str(payload["generated_at"])),
-            action=ReconciliationAction(str(payload["action"])),
+            account_id=payload["account_id"],
+            generated_at=datetime.fromisoformat(payload["generated_at"]),
+            action=ReconciliationAction(payload["action"]),
             drifts=tuple(
                 ReconciliationDrift(
-                    category=DriftCategory(str(drift["category"])),
-                    account_id=str(drift["account_id"]),
-                    client_order_id=(
-                        None
-                        if drift.get("client_order_id") is None
-                        else str(drift["client_order_id"])
-                    ),
-                    detail=str(drift["detail"]),
+                    category=DriftCategory(drift["category"]),
+                    account_id=drift["account_id"],
+                    client_order_id=drift["client_order_id"],
+                    detail=drift["detail"],
                 )
                 for drift in payload["drifts"]
             ),

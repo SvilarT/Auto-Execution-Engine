@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol, TypedDict
 from urllib.parse import urlencode
 
 import requests
@@ -20,15 +20,32 @@ _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _TERMINAL_STATUS_CODES = {400, 401, 403, 404, 422}
 
 
+class AlpacaOrderPayload(TypedDict, total=False):
+    id: str
+    client_order_id: str
+    status: str
+    message: str
+    detail: str
+    error: str
+    code: str
+
+
+class HTTPResponse(Protocol):
+    status_code: int
+    text: str
+
+    def json(self) -> object: ...
+
+
 class HTTPSession(Protocol):
     def post(
         self,
         url: str,
         *,
-        json: dict[str, Any],
+        json: dict[str, str],
         headers: dict[str, str],
         timeout: float,
-    ) -> Any: ...
+    ) -> HTTPResponse: ...
 
     def get(
         self,
@@ -36,7 +53,7 @@ class HTTPSession(Protocol):
         *,
         headers: dict[str, str],
         timeout: float,
-    ) -> Any: ...
+    ) -> HTTPResponse: ...
 
 
 @dataclass(frozen=True)
@@ -236,8 +253,8 @@ def load_alpaca_trading_config(*, mode: ExecutionMode) -> AlpacaTradingConfig:
     )
 
 
-def _build_payload(*, request, config: AlpacaTradingConfig) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+def _build_payload(*, request, config: AlpacaTradingConfig) -> dict[str, str]:
+    payload: dict[str, str] = {
         "symbol": request.symbol,
         "qty": _format_decimal(request.quantity),
         "side": request.side.value,
@@ -252,17 +269,18 @@ def _build_payload(*, request, config: AlpacaTradingConfig) -> dict[str, Any]:
 
 def _submission_from_order_payload(
     *,
-    payload: Any,
+    payload: object,
     account_id: str,
     client_order_id: str,
 ) -> RegisteredSubmission | None:
     if not isinstance(payload, dict):
         return None
-    broker_order_id = payload.get("id")
+    order_payload: AlpacaOrderPayload = payload
+    broker_order_id = order_payload.get("id")
     if not isinstance(broker_order_id, str) or not broker_order_id.strip():
         return None
-    broker_client_order_id = payload.get("client_order_id", client_order_id)
-    status = str(payload.get("status", "accepted"))
+    broker_client_order_id = order_payload.get("client_order_id", client_order_id)
+    status = str(order_payload.get("status", "accepted"))
     return RegisteredSubmission(
         account_id=account_id,
         client_order_id=str(broker_client_order_id),
@@ -273,35 +291,37 @@ def _submission_from_order_payload(
     )
 
 
-def _extract_broker_order_id(payload: Any) -> str | None:
+def _extract_broker_order_id(payload: object) -> str | None:
     if not isinstance(payload, dict):
         return None
-    broker_order_id = payload.get("id")
+    order_payload: AlpacaOrderPayload = payload
+    broker_order_id = order_payload.get("id")
     if isinstance(broker_order_id, str) and broker_order_id.strip():
         return broker_order_id
     return None
 
 
-def _error_message(*, status_code: int, body: Any, default_message: str) -> str:
+def _error_message(*, status_code: int, body: object, default_message: str) -> str:
     detail = _extract_detail(body)
     if detail:
         return f"{default_message}: HTTP {status_code} - {detail}"
     return f"{default_message}: HTTP {status_code}"
 
 
-def _extract_detail(body: Any) -> str | None:
+def _extract_detail(body: object) -> str | None:
     if isinstance(body, dict):
+        error_payload: AlpacaOrderPayload = body
         for key in ("message", "detail", "error", "code"):
-            value = body.get(key)
+            value = error_payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        return json.dumps(body, sort_keys=True)
+        return json.dumps(error_payload, sort_keys=True)
     if isinstance(body, str) and body.strip():
         return body.strip()
     return None
 
 
-def _safe_json(response: Any) -> Any:
+def _safe_json(response: HTTPResponse) -> object:
     try:
         return response.json()
     except ValueError:
