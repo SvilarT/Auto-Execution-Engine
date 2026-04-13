@@ -8,6 +8,9 @@ from typing import Iterable, TypedDict, cast
 from auto_execution_engine.adapters.broker.models import (
     BrokerRetryDisposition,
     BrokerSubmissionOutcome,
+    CanonicalBrokerOrderStatus,
+    RawBrokerActivity,
+    RawBrokerOrderSnapshot,
 )
 from auto_execution_engine.adapters.broker.service import (
     BrokerOrderRequest,
@@ -31,6 +34,13 @@ from auto_execution_engine.observability_models import (
 from auto_execution_engine.promotion_gates import (
     PromotionCriterionResult,
     PromotionGateDecisionRecord,
+)
+from auto_execution_engine.reconciliation.broker_sync_models import (
+    BrokerActivityIngestionResult,
+    BrokerSyncBatchResult,
+    BrokerSyncCursor,
+    BrokerSyncRunRecord,
+    BrokerSyncRunStatus,
 )
 from auto_execution_engine.reconciliation.models import (
     BrokerOrderSnapshot,
@@ -83,6 +93,36 @@ class ReconciliationReportPayload(TypedDict):
     generated_at: str
     action: str
     drifts: list[ReconciliationDriftPayload]
+
+
+class RawBrokerOrderPayload(TypedDict):
+    account_id: str
+    broker_order_id: str
+    client_order_id: str
+    symbol: str
+    raw_status: str
+    canonical_status: str
+    filled_quantity: float
+    raw_payload: dict[str, object]
+    observed_at: str
+
+
+class RawBrokerActivityPayload(TypedDict):
+    account_id: str
+    activity_id: str
+    activity_type: str
+    client_order_id: str | None
+    broker_order_id: str | None
+    raw_payload: dict[str, object]
+    occurred_at: str
+
+
+class BrokerSyncBatchPayload(TypedDict):
+    account_id: str
+    raw_order_count: int
+    raw_activity_count: int
+    duplicate_activity_count: int
+    next_activity_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -265,6 +305,77 @@ class _SQLiteStore:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_account ON reconciliation_runs(account_id, run_sequence)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_sync_raw_orders (
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                broker_order_id TEXT NOT NULL,
+                client_order_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                raw_status TEXT NOT NULL,
+                canonical_status TEXT NOT NULL,
+                filled_quantity REAL NOT NULL,
+                observed_at TEXT NOT NULL,
+                raw_payload_json TEXT NOT NULL,
+                UNIQUE(account_id, broker_order_id, observed_at)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broker_sync_raw_orders_account ON broker_sync_raw_orders(account_id, sequence_number)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broker_sync_raw_orders_client ON broker_sync_raw_orders(client_order_id, sequence_number)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_sync_activities (
+                sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                activity_id TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                client_order_id TEXT,
+                broker_order_id TEXT,
+                occurred_at TEXT NOT NULL,
+                raw_payload_json TEXT NOT NULL,
+                UNIQUE(account_id, activity_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broker_sync_activities_account ON broker_sync_activities(account_id, sequence_number)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broker_sync_activities_order ON broker_sync_activities(account_id, client_order_id, sequence_number)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_sync_cursors (
+                account_id TEXT PRIMARY KEY,
+                activity_cursor TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_sync_runs (
+                run_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                account_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                batch_result_json TEXT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broker_sync_runs_account ON broker_sync_runs(account_id, run_sequence)"
         )
         connection.execute(
             """
@@ -988,6 +1099,298 @@ class SQLiteReconciliationReportStore(_SQLiteStore):
         )
 
 
+class SQLiteBrokerSyncStore(_SQLiteStore):
+    """Durable storage for raw broker truth, ingestion cursors, and sync runs."""
+
+    def initialize(self) -> None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+
+    def append_raw_orders(self, *, orders: Iterable[RawBrokerOrderSnapshot]) -> int:
+        serialized_orders = [self._serialize_raw_order(order) for order in orders]
+        if not serialized_orders:
+            return 0
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO broker_sync_raw_orders(
+                    account_id,
+                    broker_order_id,
+                    client_order_id,
+                    symbol,
+                    raw_status,
+                    canonical_status,
+                    filled_quantity,
+                    observed_at,
+                    raw_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        payload["account_id"],
+                        payload["broker_order_id"],
+                        payload["client_order_id"],
+                        payload["symbol"],
+                        payload["raw_status"],
+                        payload["canonical_status"],
+                        payload["filled_quantity"],
+                        payload["observed_at"],
+                        json.dumps(payload["raw_payload"], sort_keys=True),
+                    )
+                    for payload in serialized_orders
+                ],
+            )
+        return len(serialized_orders)
+
+    def record_activity(self, *, activity: RawBrokerActivity) -> BrokerActivityIngestionResult:
+        payload = self._serialize_raw_activity(activity)
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO broker_sync_activities(
+                    account_id,
+                    activity_id,
+                    activity_type,
+                    client_order_id,
+                    broker_order_id,
+                    occurred_at,
+                    raw_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["account_id"],
+                    payload["activity_id"],
+                    payload["activity_type"],
+                    payload["client_order_id"],
+                    payload["broker_order_id"],
+                    payload["occurred_at"],
+                    json.dumps(payload["raw_payload"], sort_keys=True),
+                ),
+            )
+        return BrokerActivityIngestionResult(
+            account_id=activity.account_id,
+            activity_id=activity.activity_id,
+            duplicate=cursor.rowcount == 0,
+        )
+
+    def update_cursor(self, *, cursor_record: BrokerSyncCursor) -> None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO broker_sync_cursors(account_id, activity_cursor, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    activity_cursor = excluded.activity_cursor,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cursor_record.account_id,
+                    cursor_record.activity_cursor,
+                    cursor_record.updated_at.isoformat(),
+                ),
+            )
+
+    def load_cursor(self, *, account_id: str) -> BrokerSyncCursor | None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            row = connection.execute(
+                """
+                SELECT account_id, activity_cursor, updated_at
+                FROM broker_sync_cursors
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return BrokerSyncCursor(
+            account_id=str(row["account_id"]),
+            activity_cursor=str(row["activity_cursor"]) if row["activity_cursor"] is not None else None,
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def append_run(self, *, record: BrokerSyncRunRecord) -> None:
+        serialized_batch = None
+        if record.batch_result is not None:
+            serialized_batch = json.dumps(
+                self._serialize_batch_result(record.batch_result),
+                sort_keys=True,
+            )
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO broker_sync_runs(
+                    run_id,
+                    account_id,
+                    owner_id,
+                    started_at,
+                    completed_at,
+                    status,
+                    detail,
+                    batch_result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.run_id,
+                    record.account_id,
+                    record.owner_id,
+                    record.started_at.isoformat(),
+                    record.completed_at.isoformat(),
+                    record.status.value,
+                    record.detail,
+                    serialized_batch,
+                ),
+            )
+
+    def load_latest_run(self, *, account_id: str) -> BrokerSyncRunRecord | None:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            row = connection.execute(
+                """
+                SELECT run_id, account_id, owner_id, started_at, completed_at, status, detail, batch_result_json
+                FROM broker_sync_runs
+                WHERE account_id = ?
+                ORDER BY run_sequence DESC
+                LIMIT 1
+                """,
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._run_from_row(row)
+
+    def list_runs(self, *, account_id: str) -> list[BrokerSyncRunRecord]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT run_id, account_id, owner_id, started_at, completed_at, status, detail, batch_result_json
+                FROM broker_sync_runs
+                WHERE account_id = ?
+                ORDER BY run_sequence ASC
+                """,
+                (account_id,),
+            ).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
+    def list_raw_orders(self, *, account_id: str) -> list[RawBrokerOrderSnapshot]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT account_id, broker_order_id, client_order_id, symbol, raw_status,
+                       canonical_status, filled_quantity, observed_at, raw_payload_json
+                FROM broker_sync_raw_orders
+                WHERE account_id = ?
+                ORDER BY sequence_number ASC
+                """,
+                (account_id,),
+            ).fetchall()
+        return [self._raw_order_from_row(row) for row in rows]
+
+    def list_raw_activities(self, *, account_id: str) -> list[RawBrokerActivity]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT account_id, activity_id, activity_type, client_order_id,
+                       broker_order_id, occurred_at, raw_payload_json
+                FROM broker_sync_activities
+                WHERE account_id = ?
+                ORDER BY sequence_number ASC
+                """,
+                (account_id,),
+            ).fetchall()
+        return [self._raw_activity_from_row(row) for row in rows]
+
+    def _serialize_raw_order(self, order: RawBrokerOrderSnapshot) -> RawBrokerOrderPayload:
+        return RawBrokerOrderPayload(
+            account_id=order.account_id,
+            broker_order_id=order.broker_order_id,
+            client_order_id=order.client_order_id,
+            symbol=order.symbol,
+            raw_status=order.raw_status,
+            canonical_status=order.canonical_status.value,
+            filled_quantity=order.filled_quantity,
+            raw_payload=order.raw_payload,
+            observed_at=order.observed_at,
+        )
+
+    def _serialize_raw_activity(self, activity: RawBrokerActivity) -> RawBrokerActivityPayload:
+        return RawBrokerActivityPayload(
+            account_id=activity.account_id,
+            activity_id=activity.activity_id,
+            activity_type=activity.activity_type,
+            client_order_id=activity.client_order_id,
+            broker_order_id=activity.broker_order_id,
+            raw_payload=activity.raw_payload,
+            occurred_at=activity.occurred_at,
+        )
+
+    def _serialize_batch_result(self, result: BrokerSyncBatchResult) -> BrokerSyncBatchPayload:
+        return BrokerSyncBatchPayload(
+            account_id=result.account_id,
+            raw_order_count=result.raw_order_count,
+            raw_activity_count=result.raw_activity_count,
+            duplicate_activity_count=result.duplicate_activity_count,
+            next_activity_cursor=result.next_activity_cursor,
+        )
+
+    def _batch_result_from_payload(self, payload: BrokerSyncBatchPayload) -> BrokerSyncBatchResult:
+        return BrokerSyncBatchResult(
+            account_id=payload["account_id"],
+            raw_order_count=int(payload["raw_order_count"]),
+            raw_activity_count=int(payload["raw_activity_count"]),
+            duplicate_activity_count=int(payload["duplicate_activity_count"]),
+            next_activity_cursor=payload["next_activity_cursor"],
+        )
+
+    def _run_from_row(self, row: sqlite3.Row) -> BrokerSyncRunRecord:
+        batch_result = None
+        if row["batch_result_json"] is not None:
+            batch_result = self._batch_result_from_payload(
+                cast(BrokerSyncBatchPayload, json.loads(row["batch_result_json"]))
+            )
+        return BrokerSyncRunRecord(
+            run_id=str(row["run_id"]),
+            account_id=str(row["account_id"]),
+            owner_id=str(row["owner_id"]),
+            started_at=datetime.fromisoformat(row["started_at"]),
+            completed_at=datetime.fromisoformat(row["completed_at"]),
+            status=BrokerSyncRunStatus(row["status"]),
+            detail=str(row["detail"]),
+            batch_result=batch_result,
+        )
+
+    def _raw_order_from_row(self, row: sqlite3.Row) -> RawBrokerOrderSnapshot:
+        return RawBrokerOrderSnapshot(
+            account_id=str(row["account_id"]),
+            broker_order_id=str(row["broker_order_id"]),
+            client_order_id=str(row["client_order_id"]),
+            symbol=str(row["symbol"]),
+            raw_status=str(row["raw_status"]),
+            canonical_status=CanonicalBrokerOrderStatus(str(row["canonical_status"])),
+            filled_quantity=float(row["filled_quantity"]),
+            raw_payload=cast(dict[str, object], json.loads(row["raw_payload_json"])),
+            observed_at=str(row["observed_at"]),
+        )
+
+    def _raw_activity_from_row(self, row: sqlite3.Row) -> RawBrokerActivity:
+        return RawBrokerActivity(
+            account_id=str(row["account_id"]),
+            activity_id=str(row["activity_id"]),
+            activity_type=str(row["activity_type"]),
+            client_order_id=str(row["client_order_id"]) if row["client_order_id"] is not None else None,
+            broker_order_id=str(row["broker_order_id"]) if row["broker_order_id"] is not None else None,
+            raw_payload=cast(dict[str, object], json.loads(row["raw_payload_json"])),
+            occurred_at=str(row["occurred_at"]),
+        )
+
+
 class SQLiteSubmissionBook(_SQLiteStore):
     """Durable broker submission deduplication that survives process restarts."""
 
@@ -1561,6 +1964,7 @@ class SQLiteOrderStore:
         self._event_store = SQLiteEventStore(db_path=self.db_path)
         self._order_journal = SQLiteOrderJournal(db_path=self.db_path)
         self._reconciliation_reports = SQLiteReconciliationReportStore(db_path=self.db_path)
+        self._broker_sync_store = SQLiteBrokerSyncStore(db_path=self.db_path)
         self._submission_book = SQLiteSubmissionBook(db_path=self.db_path)
         self._lease_backend = SQLiteAccountLeaseBackend(db_path=self.db_path)
         self._observability_store = SQLiteObservabilityStore(db_path=self.db_path)
@@ -1572,6 +1976,7 @@ class SQLiteOrderStore:
         self._event_store.initialize()
         self._order_journal.initialize()
         self._reconciliation_reports.initialize()
+        self._broker_sync_store.initialize()
         self._submission_book.initialize()
         self._lease_backend.initialize()
         self._observability_store.initialize()
@@ -1910,6 +2315,35 @@ class SQLiteOrderStore:
 
     def list_reconciliation_runs(self, *, account_id: str) -> list[ReconciliationRunRecord]:
         return self._reconciliation_reports.list_runs(account_id=account_id)
+
+    def append_broker_sync_raw_orders(self, *, orders: Iterable[RawBrokerOrderSnapshot]) -> int:
+        return self._broker_sync_store.append_raw_orders(orders=orders)
+
+    def record_broker_sync_activity(
+        self, *, activity: RawBrokerActivity
+    ) -> BrokerActivityIngestionResult:
+        return self._broker_sync_store.record_activity(activity=activity)
+
+    def load_broker_sync_cursor(self, *, account_id: str) -> BrokerSyncCursor | None:
+        return self._broker_sync_store.load_cursor(account_id=account_id)
+
+    def update_broker_sync_cursor(self, *, cursor: BrokerSyncCursor) -> None:
+        self._broker_sync_store.update_cursor(cursor_record=cursor)
+
+    def append_broker_sync_run(self, *, record: BrokerSyncRunRecord) -> None:
+        self._broker_sync_store.append_run(record=record)
+
+    def load_latest_broker_sync_run(self, *, account_id: str) -> BrokerSyncRunRecord | None:
+        return self._broker_sync_store.load_latest_run(account_id=account_id)
+
+    def list_broker_sync_runs(self, *, account_id: str) -> list[BrokerSyncRunRecord]:
+        return self._broker_sync_store.list_runs(account_id=account_id)
+
+    def list_broker_sync_raw_orders(self, *, account_id: str) -> list[RawBrokerOrderSnapshot]:
+        return self._broker_sync_store.list_raw_orders(account_id=account_id)
+
+    def list_broker_sync_raw_activities(self, *, account_id: str) -> list[RawBrokerActivity]:
+        return self._broker_sync_store.list_raw_activities(account_id=account_id)
 
     def build_submission_book(self) -> SQLiteSubmissionBook:
         self._submission_book.initialize()

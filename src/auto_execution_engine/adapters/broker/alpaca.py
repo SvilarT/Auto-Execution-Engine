@@ -9,10 +9,14 @@ from urllib.parse import urlencode
 import requests
 
 from auto_execution_engine.adapters.broker.models import (
+    BrokerOrderActivityPage,
     BrokerRetryDisposition,
     BrokerSubmissionOutcome,
+    CanonicalBrokerOrderStatus,
+    RawBrokerActivity,
+    RawBrokerOrderSnapshot,
 )
-from auto_execution_engine.adapters.broker.service import RegisteredSubmission
+from auto_execution_engine.adapters.broker.service import BrokerStateReader, RegisteredSubmission
 from auto_execution_engine.config.execution_mode import ConfigurationError, ExecutionMode
 
 
@@ -82,7 +86,7 @@ class AlpacaTradingConfig:
 
 
 @dataclass(frozen=True)
-class AlpacaBrokerSubmitter:
+class AlpacaBrokerSubmitter(BrokerStateReader):
     config: AlpacaTradingConfig
     session: HTTPSession | None = None
 
@@ -197,13 +201,82 @@ class AlpacaBrokerSubmitter:
             ),
         )
 
-    def _lookup_existing_submission(
+    def list_order_snapshots(self, *, account_id: str) -> tuple[RawBrokerOrderSnapshot, ...]:
+        session = self.session or requests.Session()
+        try:
+            response = session.get(
+                self.config.orders_url,
+                headers=self.config.headers(),
+                timeout=self.config.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"failed to load broker orders for account {account_id}: {exc}") from exc
+        if not 200 <= int(response.status_code) < 300:
+            raise RuntimeError(
+                _error_message(
+                    status_code=int(response.status_code),
+                    body=_safe_json(response),
+                    default_message=f"failed to load broker orders for account {account_id}",
+                )
+            )
+        body = _safe_json(response)
+        if not isinstance(body, list):
+            raise RuntimeError("broker returned an unreadable order list payload")
+        snapshots: list[RawBrokerOrderSnapshot] = []
+        for payload in body:
+            snapshot = _raw_order_snapshot_from_payload(payload=payload, account_id=account_id)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return tuple(snapshots)
+
+    def list_order_activities(
         self,
         *,
-        session: HTTPSession,
         account_id: str,
-        client_order_id: str,
-    ) -> RegisteredSubmission | None:
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> BrokerOrderActivityPage:
+        session = self.session or requests.Session()
+        query: dict[str, str] = {"direction": "asc", "page_size": str(limit)}
+        if cursor is not None:
+            query["page_token"] = cursor
+        activity_url = f"{self.config.trading_base_url.rstrip('/')}/v2/account/activities/FILL?{urlencode(query)}"
+        try:
+            response = session.get(
+                activity_url,
+                headers=self.config.headers(),
+                timeout=self.config.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"failed to load broker activities for account {account_id}: {exc}") from exc
+        if not 200 <= int(response.status_code) < 300:
+            raise RuntimeError(
+                _error_message(
+                    status_code=int(response.status_code),
+                    body=_safe_json(response),
+                    default_message=f"failed to load broker activities for account {account_id}",
+                )
+            )
+        body = _safe_json(response)
+        if not isinstance(body, list):
+            raise RuntimeError("broker returned an unreadable activity payload")
+        activities: list[RawBrokerActivity] = []
+        for payload in body:
+            activity = _raw_activity_from_payload(payload=payload, account_id=account_id)
+            if activity is not None:
+                activities.append(activity)
+        next_cursor = activities[-1].activity_id if activities else cursor
+        return BrokerOrderActivityPage(
+            account_id=account_id,
+            activities=tuple(activities),
+            cursor=next_cursor,
+            has_more=len(activities) >= limit,
+        )
+
+    def get_order_by_client_order_id(
+        self, *, account_id: str, client_order_id: str
+    ) -> RawBrokerOrderSnapshot | None:
+        session = self.session or requests.Session()
         lookup_url = f"{self.config.order_lookup_base_url}?{urlencode({'client_order_id': client_order_id})}"
         try:
             response = session.get(
@@ -211,17 +284,50 @@ class AlpacaBrokerSubmitter:
                 headers=self.config.headers(),
                 timeout=self.config.timeout_seconds,
             )
-        except requests.RequestException:
-            return None
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"failed to look up broker order {client_order_id} for account {account_id}: {exc}"
+            ) from exc
         if int(response.status_code) == 404:
             return None
         if not 200 <= int(response.status_code) < 300:
-            return None
-        body = _safe_json(response)
-        return _submission_from_order_payload(
-            payload=body,
+            raise RuntimeError(
+                _error_message(
+                    status_code=int(response.status_code),
+                    body=_safe_json(response),
+                    default_message=(
+                        f"failed to look up broker order {client_order_id} for account {account_id}"
+                    ),
+                )
+            )
+        return _raw_order_snapshot_from_payload(
+            payload=_safe_json(response),
             account_id=account_id,
-            client_order_id=client_order_id,
+        )
+
+    def _lookup_existing_submission(
+        self,
+        *,
+        session: HTTPSession,
+        account_id: str,
+        client_order_id: str,
+    ) -> RegisteredSubmission | None:
+        try:
+            snapshot = self.get_order_by_client_order_id(
+                account_id=account_id,
+                client_order_id=client_order_id,
+            )
+        except RuntimeError:
+            return None
+        if snapshot is None:
+            return None
+        return RegisteredSubmission(
+            account_id=account_id,
+            client_order_id=snapshot.client_order_id,
+            broker_order_id=snapshot.broker_order_id,
+            outcome=BrokerSubmissionOutcome.ACCEPTED,
+            retry_disposition=BrokerRetryDisposition.DO_NOT_RETRY,
+            message=f"broker accepted order with status {snapshot.raw_status}",
         )
 
 
@@ -299,6 +405,96 @@ def _extract_broker_order_id(payload: object) -> str | None:
     if isinstance(broker_order_id, str) and broker_order_id.strip():
         return broker_order_id
     return None
+
+
+def _raw_order_snapshot_from_payload(
+    *, payload: object, account_id: str
+) -> RawBrokerOrderSnapshot | None:
+    if not isinstance(payload, dict):
+        return None
+    broker_order_id = payload.get("id")
+    client_order_id = payload.get("client_order_id")
+    symbol = payload.get("symbol")
+    status = payload.get("status")
+    if not all(isinstance(value, str) and value.strip() for value in (broker_order_id, client_order_id, symbol, status)):
+        return None
+    filled_quantity = _coerce_float(payload.get("filled_qty", payload.get("filled_quantity", 0.0)))
+    observed_at = _coerce_string(
+        payload.get("updated_at")
+        or payload.get("filled_at")
+        or payload.get("submitted_at")
+        or payload.get("created_at")
+    ) or ""
+    raw_payload = {str(key): value for key, value in payload.items()}
+    return RawBrokerOrderSnapshot(
+        account_id=account_id,
+        broker_order_id=broker_order_id.strip(),
+        client_order_id=client_order_id.strip(),
+        symbol=symbol.strip(),
+        raw_status=status.strip(),
+        canonical_status=_map_alpaca_status(status.strip()),
+        filled_quantity=filled_quantity,
+        raw_payload=raw_payload,
+        observed_at=observed_at,
+    )
+
+
+def _raw_activity_from_payload(*, payload: object, account_id: str) -> RawBrokerActivity | None:
+    if not isinstance(payload, dict):
+        return None
+    activity_id = _coerce_string(payload.get("id") or payload.get("activity_id"))
+    activity_type = _coerce_string(payload.get("activity_type") or payload.get("activity_type_name") or payload.get("activity_type_id") or payload.get("transaction_type") or payload.get("side") or "fill")
+    if activity_id is None or activity_type is None:
+        return None
+    return RawBrokerActivity(
+        account_id=account_id,
+        activity_id=activity_id,
+        activity_type=activity_type,
+        client_order_id=_coerce_string(payload.get("client_order_id") or payload.get("client_order_uuid") or payload.get("order_id")),
+        broker_order_id=_coerce_string(payload.get("order_id")),
+        raw_payload={str(key): value for key, value in payload.items()},
+        occurred_at=_coerce_string(payload.get("transaction_time") or payload.get("date") or payload.get("timestamp")) or "",
+    )
+
+
+def _map_alpaca_status(status: str) -> CanonicalBrokerOrderStatus:
+    normalized = status.strip().lower()
+    return {
+        "new": CanonicalBrokerOrderStatus.NEW,
+        "accepted": CanonicalBrokerOrderStatus.NEW,
+        "accepted_for_bidding": CanonicalBrokerOrderStatus.NEW,
+        "pending_new": CanonicalBrokerOrderStatus.NEW,
+        "done_for_day": CanonicalBrokerOrderStatus.ACKNOWLEDGED,
+        "partially_filled": CanonicalBrokerOrderStatus.PARTIALLY_FILLED,
+        "filled": CanonicalBrokerOrderStatus.FILLED,
+        "canceled": CanonicalBrokerOrderStatus.CANCELED,
+        "cancelled": CanonicalBrokerOrderStatus.CANCELED,
+        "rejected": CanonicalBrokerOrderStatus.REJECTED,
+        "expired": CanonicalBrokerOrderStatus.EXPIRED,
+        "pending_cancel": CanonicalBrokerOrderStatus.PENDING_CANCEL,
+        "pending_replace": CanonicalBrokerOrderStatus.PENDING_REPLACE,
+        "replaced": CanonicalBrokerOrderStatus.REPLACED,
+        "stopped": CanonicalBrokerOrderStatus.SUSPENDED,
+        "suspended": CanonicalBrokerOrderStatus.SUSPENDED,
+        "calculated": CanonicalBrokerOrderStatus.ACKNOWLEDGED,
+    }.get(normalized, CanonicalBrokerOrderStatus.UNKNOWN)
+
+
+def _coerce_string(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _coerce_float(value: object) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _error_message(*, status_code: int, body: object, default_message: str) -> str:

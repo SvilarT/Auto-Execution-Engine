@@ -3,11 +3,13 @@ from typing import Protocol
 
 from auto_execution_engine.adapters.broker.models import (
     BrokerOrderAck,
+    BrokerOrderActivityPage,
     BrokerOrderRequest,
     BrokerOrderSide,
     BrokerOrderType,
     BrokerRetryDisposition,
     BrokerSubmissionOutcome,
+    RawBrokerOrderSnapshot,
 )
 from auto_execution_engine.domain.orders.models import OrderAggregate, OrderSide, OrderType
 
@@ -123,6 +125,22 @@ class IdempotentSubmissionBook:
 
 class BrokerSubmitter(Protocol):
     def submit(self, *, request: BrokerOrderRequest) -> RegisteredSubmission: ...
+
+
+class BrokerStateReader(Protocol):
+    def list_order_snapshots(self, *, account_id: str) -> tuple[RawBrokerOrderSnapshot, ...]: ...
+
+    def list_order_activities(
+        self,
+        *,
+        account_id: str,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> BrokerOrderActivityPage: ...
+
+    def get_order_by_client_order_id(
+        self, *, account_id: str, client_order_id: str
+    ) -> RawBrokerOrderSnapshot | None: ...
 
 
 @dataclass(frozen=True)
