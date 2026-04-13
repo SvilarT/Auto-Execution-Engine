@@ -159,6 +159,48 @@ def test_paper_mode_requires_explicit_enablement(monkeypatch) -> None:
         assert "paper mode is disabled" in str(exc)
 
 
+def test_paper_mode_requires_declared_broker_configuration(monkeypatch, tmp_path: Path) -> None:
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "paper")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+    monkeypatch.delenv("AEE_ALPACA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("AEE_ALPACA_API_SECRET_KEY", raising=False)
+
+    with pytest.raises(ConfigurationError, match="missing Alpaca paper API key id"):
+        load_startup_context()
+
+
+def test_paper_mode_rejects_live_enablement_flag(monkeypatch, tmp_path: Path) -> None:
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.PAPER)
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "paper")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_ALLOW_LIVE", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "simulation_stability,order_lifecycle_recovery",
+    )
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+
+    with pytest.raises(
+        ConfigurationError,
+        match="paper startup cannot enable live mode simultaneously",
+    ):
+        load_startup_context()
+
+
 def test_live_mode_requires_operator_approval(monkeypatch) -> None:
     monkeypatch.setenv("AEE_EXECUTION_MODE", "live")
     monkeypatch.setenv("AEE_ALLOW_LIVE", "true")
@@ -173,6 +215,29 @@ def test_live_mode_requires_operator_approval(monkeypatch) -> None:
         assert False, "expected ConfigurationError"
     except ConfigurationError as exc:
         assert "operator approval" in str(exc)
+
+
+def test_live_mode_rejects_paper_enablement_flag(monkeypatch, tmp_path: Path) -> None:
+    seed_promotion_evidence(durable_state_root=tmp_path, target_mode=ExecutionMode.LIVE)
+    monkeypatch.setenv("AEE_EXECUTION_MODE", "live")
+    monkeypatch.setenv("AEE_ALLOW_PAPER", "true")
+    monkeypatch.setenv("AEE_ALLOW_LIVE", "true")
+    monkeypatch.setenv("AEE_BROKER_CREDENTIALS_PRESENT", "true")
+    monkeypatch.setenv("AEE_RISK_ENGINE_CONFIGURED", "true")
+    monkeypatch.setenv("AEE_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("AEE_DURABLE_STATE_ENABLED", "true")
+    monkeypatch.setenv("AEE_OPERATOR_APPROVAL_PRESENT", "true")
+    monkeypatch.setenv(
+        "AEE_COMPLETED_PROMOTION_DRILLS",
+        "paper_reconciliation,kill_switch_response,operator_override",
+    )
+    monkeypatch.setenv("AEE_DURABLE_STATE_ROOT", str(tmp_path))
+
+    with pytest.raises(
+        ConfigurationError,
+        match="live startup cannot enable paper mode simultaneously",
+    ):
+        load_startup_context()
 
 
 def test_live_mode_starts_only_when_all_safety_gates_are_present(

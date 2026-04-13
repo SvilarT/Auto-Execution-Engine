@@ -40,12 +40,12 @@ from auto_execution_engine.reconciliation.models import (
     ReconciliationReport,
     ReconciliationRunRecord,
 )
+from auto_execution_engine.reconciliation.runner import ReconciliationRunner
 
 
 BrokerSnapshotByAccount = dict[str, list[BrokerOrderSnapshot]]
 BrokerPositionsByAccount = dict[str, list[PositionSnapshot]]
 BrokerCashByAccount = dict[str, CashSnapshot]
-from auto_execution_engine.reconciliation.runner import ReconciliationRunner
 from auto_execution_engine.reconciliation.service import (
     AccountQuarantineRegistry,
     ReconciliationService,
@@ -65,6 +65,82 @@ class StartupContext:
     durable_state_root: Path
     promotion_gate_decision: PromotionGateDecisionRecord | None = None
     broker_adapter_config: AlpacaTradingConfig | None = None
+
+
+@dataclass(frozen=True)
+class StartupConfig:
+    """Parsed startup configuration before runtime object wiring begins."""
+
+    mode: ExecutionMode
+    safety: SafetyGateConfig
+    durable_state_root: Path
+    required_promotion_drills: tuple[str, ...] = ()
+    completed_promotion_drills: tuple[str, ...] = ()
+    promotion_min_healthy_accounts: int = 1
+
+
+def parse_startup_config() -> StartupConfig:
+    mode = _read_mode_env()
+    safety = SafetyGateConfig(
+        allow_paper=_read_bool_env("AEE_ALLOW_PAPER"),
+        allow_live=_read_bool_env("AEE_ALLOW_LIVE"),
+        broker_credentials_present=_read_bool_env("AEE_BROKER_CREDENTIALS_PRESENT"),
+        risk_engine_configured=_read_bool_env("AEE_RISK_ENGINE_CONFIGURED"),
+        reconciliation_enabled=_read_bool_env("AEE_RECONCILIATION_ENABLED"),
+        durable_state_enabled=_read_bool_env("AEE_DURABLE_STATE_ENABLED"),
+        operator_approval_present=_read_bool_env("AEE_OPERATOR_APPROVAL_PRESENT"),
+    )
+    config = StartupConfig(
+        mode=mode,
+        safety=safety,
+        durable_state_root=_read_durable_state_root(),
+        required_promotion_drills=_read_csv_env("AEE_REQUIRED_PROMOTION_DRILLS"),
+        completed_promotion_drills=_read_csv_env("AEE_COMPLETED_PROMOTION_DRILLS"),
+        promotion_min_healthy_accounts=_read_int_env(
+            "AEE_PROMOTION_MIN_HEALTHY_ACCOUNTS",
+            default=1,
+        ),
+    )
+    _validate_startup_config(config=config)
+    return config
+
+
+def _validate_startup_config(*, config: StartupConfig) -> ModeRuntimeProfile:
+    profile = validate_startup(mode=config.mode, safety=config.safety)
+    if config.mode is ExecutionMode.PAPER and config.safety.allow_live:
+        raise ConfigurationError(
+            "paper startup cannot enable live mode simultaneously; unset AEE_ALLOW_LIVE"
+        )
+    if config.mode is ExecutionMode.LIVE and config.safety.allow_paper:
+        raise ConfigurationError(
+            "live startup cannot enable paper mode simultaneously; unset AEE_ALLOW_PAPER"
+        )
+    return profile
+
+
+def _load_broker_adapter_config(*, config: StartupConfig) -> AlpacaTradingConfig | None:
+    if config.mode is ExecutionMode.SIMULATION:
+        return None
+    return load_alpaca_trading_config(mode=config.mode)
+
+
+def _promotion_gate_inputs_from_config(*, config: StartupConfig) -> PromotionGateInputs:
+    return PromotionGateInputs(
+        safety=config.safety,
+        required_drills=config.required_promotion_drills,
+        completed_drills=config.completed_promotion_drills,
+        min_healthy_accounts=config.promotion_min_healthy_accounts,
+    )
+
+
+def _evaluate_mode_promotion_gate(*, config: StartupConfig) -> PromotionGateDecisionRecord | None:
+    if config.mode is ExecutionMode.SIMULATION:
+        return None
+    return _evaluate_promotion_gate(
+        mode=config.mode,
+        durable_state_root=config.durable_state_root,
+        inputs=_promotion_gate_inputs_from_config(config=config),
+    )
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -324,8 +400,8 @@ def _read_int_env(name: str, default: int) -> int:
 def _evaluate_promotion_gate(
     *,
     mode: ExecutionMode,
-    safety: SafetyGateConfig,
     durable_state_root: Path,
+    inputs: PromotionGateInputs,
 ) -> PromotionGateDecisionRecord:
     source_mode = promotion_source_mode(mode)
     if source_mode is None:
@@ -350,15 +426,7 @@ def _evaluate_promotion_gate(
         source_mode=source_mode,
         evidence_store=evidence_store,
         decision_store=decision_store,
-        inputs=PromotionGateInputs(
-            safety=safety,
-            required_drills=_read_csv_env("AEE_REQUIRED_PROMOTION_DRILLS"),
-            completed_drills=_read_csv_env("AEE_COMPLETED_PROMOTION_DRILLS"),
-            min_healthy_accounts=_read_int_env(
-                "AEE_PROMOTION_MIN_HEALTHY_ACCOUNTS",
-                default=1,
-            ),
-        ),
+        inputs=inputs,
     )
     evaluator.persist(decision_store=decision_store, record=decision)
     if not decision.approved:
@@ -375,36 +443,15 @@ def _evaluate_promotion_gate(
 
 
 def load_startup_context() -> StartupContext:
-    mode = _read_mode_env()
-
-    safety = SafetyGateConfig(
-        allow_paper=_read_bool_env("AEE_ALLOW_PAPER"),
-        allow_live=_read_bool_env("AEE_ALLOW_LIVE"),
-        broker_credentials_present=_read_bool_env("AEE_BROKER_CREDENTIALS_PRESENT"),
-        risk_engine_configured=_read_bool_env("AEE_RISK_ENGINE_CONFIGURED"),
-        reconciliation_enabled=_read_bool_env("AEE_RECONCILIATION_ENABLED"),
-        durable_state_enabled=_read_bool_env("AEE_DURABLE_STATE_ENABLED"),
-        operator_approval_present=_read_bool_env("AEE_OPERATOR_APPROVAL_PRESENT"),
-    )
-
-    durable_state_root = _read_durable_state_root()
-    promotion_gate_decision: PromotionGateDecisionRecord | None = None
-    broker_adapter_config: AlpacaTradingConfig | None = None
-    if mode is ExecutionMode.SIMULATION:
-        profile = validate_startup(mode=mode, safety=safety)
-    else:
-        promotion_gate_decision = _evaluate_promotion_gate(
-            mode=mode,
-            safety=safety,
-            durable_state_root=durable_state_root,
-        )
-        profile = get_runtime_profile(mode)
-        broker_adapter_config = load_alpaca_trading_config(mode=mode)
+    config = parse_startup_config()
+    profile = _validate_startup_config(config=config)
+    broker_adapter_config = _load_broker_adapter_config(config=config)
+    promotion_gate_decision = _evaluate_mode_promotion_gate(config=config)
 
     return StartupContext(
         profile=profile,
-        safety=safety,
-        durable_state_root=durable_state_root,
+        safety=config.safety,
+        durable_state_root=config.durable_state_root,
         promotion_gate_decision=promotion_gate_decision,
         broker_adapter_config=broker_adapter_config,
     )
