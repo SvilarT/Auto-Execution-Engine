@@ -1,18 +1,22 @@
-# Auto-Execution-Engine
-
 ## Executive Summary
 
-**Auto-Execution-Engine** is the clean rebuild of the prior autonomous trading prototype into a production-grade trading platform. The purpose of this repository is not to market an unfinished bot as "autonomous" or "institutional." The purpose is to build a trading system that can eventually handle real capital without ambiguity about execution mode, financial state, reconciliation status, or risk authority.
+**Auto-Execution-Engine** is a **production-track execution foundation** for a future live-capital trading system. It is not yet paper-ready and it is not yet live-ready. The purpose of this repository is to build the execution, persistence, reconciliation, and control-plane substrate that a real trading engine would require before any claim of deployment readiness could be credible.
 
-The foundational principle of this project is simple:
+The governing principle of the repository is straightforward.
 
-> A trading system is not live-ready until every order, fill, position mutation, balance mutation, risk decision, and operator action is durable, attributable, and reconcilable against broker truth.
+> A trading system is not readiness-capable until every order, fill, position mutation, balance mutation, risk decision, and operator action is durable, attributable, and reconcilable against broker truth.
 
-This repository therefore prioritizes **correctness before sophistication**, **risk control before strategy complexity**, and **truthful system behavior before performance claims**.
+The repository therefore prioritizes **correctness before sophistication**, **risk control before strategy complexity**, and **truthful system behavior before performance claims**.
+
+## Current Status
+
+The current truthful description of the codebase is that it is a **strong production-track foundation**. It already contains important structural elements such as execution-mode isolation, durable order-state persistence, restart-oriented submission recovery, broker-facing submission flows, startup safety validation, and reconciliation scaffolding.
+
+That said, the repository should not be mistaken for a paper-trading-ready engine or a live-capable platform. Several mandatory milestones still remain before those claims would be justified, including broker-state synchronization, Decimal-based financial correctness, cancel-and-replace truth, market-data integrity enforcement, closed-loop exposure truth, and deeper operational controls.
 
 ## What This Repository Is For
 
-This repository is the production-track codebase for the following capabilities:
+This repository exists to develop the safety-critical execution foundation for the following capabilities.
 
 | Capability | Purpose |
 |---|---|
@@ -25,23 +29,31 @@ This repository is the production-track codebase for the following capabilities:
 
 ## What This Repository Is Not For
 
-This repository is **not** intended to preserve prototype shortcuts that are unsafe for live trading. It should not inherit ambiguous execution semantics, non-durable state handling, unsafe secrets management, synthetic fallback behavior in non-simulation paths, or route-coupled runtime control patterns.
+This repository is **not** a marketing wrapper for an unfinished autonomous bot. It is not intended to preserve unsafe prototype shortcuts, ambiguous execution semantics, non-durable state handling, synthetic fallback behavior in non-simulation paths, or readiness claims that the code cannot yet support.
 
-Any logic salvaged from legacy systems must be reintroduced only after it satisfies the architectural constraints defined in this repository.
+Any logic reintroduced from legacy systems must satisfy the architectural constraints of this repository before it can be considered part of the production track.
 
-## Initial Build Priorities
+## Readiness Gates
 
-The first implementation priorities are ordered around live-trading safety rather than feature breadth.
+The repository should only be described as **paper-ready** or **live-ready** after explicit gates have been satisfied. Those gates are intentionally stricter than feature-completeness claims.
 
-| Priority | Workstream | Rationale |
+| Readiness target | Minimum gates that must be satisfied before the claim is credible |
+|---|---|
+| **Paper-ready** | Broker-state synchronization is complete, Decimal financial correctness is in place, cancel-and-replace truth exists, market-data freshness and integrity checks are active, exposure and cash truth are closed loop, startup validation is fail-closed, and end-to-end restart recovery is proven |
+| **Live-ready** | All paper gates are satisfied, promotion gates are evidenced, reconciliation and quarantine controls are operational, operator approvals are enforced, observability and runtime health reporting are production-usable, and failure drills have been executed successfully |
+
+Until those gates are satisfied, the correct maturity framing remains **production-track foundation**.
+
+## Near-Term Milestone Framing
+
+The near-term roadmap is ordered around safety and truth preservation rather than feature breadth.
+
+| Sequence | Near-term milestone | Why it comes next |
 |---|---|---|
-| **1** | Hard mode separation | Prevent accidental semantic crossover between simulation, paper, and live |
-| **2** | Financial core | Establish event ledger, order state machine, and durable projections |
-| **3** | Reconciliation engine | Ensure internal truth is continuously validated against broker truth |
-| **4** | Independent risk engine | Protect capital with fail-closed policy enforcement |
-| **5** | Control-plane separation | Prevent UI or API lifecycle failures from destabilizing trading execution |
-| **6** | Security hardening | Protect privileged operations, sessions, and broker credentials |
-| **7** | Verification and drills | Prove failure behavior before any real capital is exposed |
+| **Phase 0** | Foundation stabilization | Establish packaging truth, startup hardening, maturity framing, precision policy, and explicit boundaries |
+| **Step 13** | Broker-state synchronization | Internal order truth must converge with broker order truth before richer execution features are added |
+| **Step 14** | Decimal financial correctness | Financial state must stop depending on float semantics before the system becomes larger and harder to migrate |
+| **Next execution milestones** | Cancel/replace, market-data truth, exposure closure, and stronger operational controls | These depend on broker truth and financial precision already being trustworthy |
 
 ## Repository Structure
 
@@ -49,7 +61,7 @@ The repository is organized around domain correctness and operational separation
 
 | Path | Responsibility |
 |---|---|
-| `docs/` | Architecture, design decisions, runbooks, and operational specifications |
+| `docs/` | Architecture, design decisions, runbooks, readiness policy, and operational specifications |
 | `src/auto_execution_engine/domain/` | Core financial domain models and invariants |
 | `src/auto_execution_engine/application/` | Use cases, command handlers, and orchestration services |
 | `src/auto_execution_engine/adapters/` | Broker, market-data, and persistence integrations |
@@ -61,6 +73,6 @@ The repository is organized around domain correctness and operational separation
 
 ## Build Standard
 
-The standard for this repository is **production-grade trading infrastructure**, not demo quality. Every subsystem should be designed with restart safety, idempotency, explicit failure handling, observability, and auditability in mind.
+The standard for this repository is **production-grade trading infrastructure**, not demo quality. Every subsystem should be designed with restart safety, idempotency, explicit failure handling, observability, auditability, and mode-safe behavior in mind.
 
 Performance will matter, but only after correctness, safety, and trustworthiness are established.
